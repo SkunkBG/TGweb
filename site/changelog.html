@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Changelog — __PROJECT__</title>
+<link rel="stylesheet" href="/style.css">
+</head><body>
+<header><div class="wrap">
+  <div class="logo">__PROJECT_LC__<span>.</span></div>
+  <nav><a href="/">Home</a><a href="/docs.html">Docs</a><a href="/status.html">Status</a><a href="/privacy.html">Privacy</a></nav>
+</div></header>
+<main class="wrap">
+  <h1>Changelog</h1>
+  <p class="lead">Versions are <code>MAJOR.MINOR.PATCH</code>. The HTTP API is stable within a
+  minor; the on-disk layout can change on any minor, so take a copy of the data directory
+  before upgrading one.</p>
+
+  <h2>0.7.x</h2>
+  <p><b>0.7.3</b> — Fix a leak where a cancelled transcode left its scratch directory behind.
+  Segment writer now fsyncs the playlist after the last rendition, not after each one.</p>
+  <p><b>0.7.2</b> — <code>retranscode</code> accepts a <code>keep_previous</code> flag so you can
+  A/B two ladders on the same asset. Storage sweep runs hourly instead of daily.</p>
+  <p><b>0.7.0</b> — Pull-from-URL ingest. Webhook signatures moved to
+  <code>X-Signature</code>; the old header stays for one more minor.</p>
+
+  <h2>0.6.x</h2>
+  <p><b>0.6.4</b> — Hardware encode detection no longer probes on every job, result is cached
+  for the lifetime of the process.</p>
+  <p><b>0.6.1</b> — Resumable uploads. Sources above the configured limit are now rejected at
+  the first chunk rather than after the whole body arrived.</p>
+  <p><b>0.6.0</b> — Profiles became named ladders in config instead of per-request JSON.
+  Breaking: the old <code>ladder</code> request field is gone.</p>
+
+  <h2>Older</h2>
+  <p>Anything before 0.6 was a shell script with a cron entry and is not documented here.</p>
+</main>
+<footer><div class="wrap">
+  <span>__PROJECT_LC__ — __HOST__</span>
+  <a href="/">Home</a><a href="/docs.html">Docs</a>
+  <span class="build">build __BUILD__</span>
+</div></footer>
+</body></html>

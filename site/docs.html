@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>API reference — __PROJECT__</title>
+<meta name="description" content="__PROJECT__ HTTP API: assets, sources, profiles, playback, webhooks.">
+<link rel="stylesheet" href="/style.css">
+</head><body>
+<header><div class="wrap">
+  <div class="logo">__PROJECT_LC__<span>.</span></div>
+  <nav><a href="/">Home</a><a href="/changelog.html">Changelog</a><a href="/status.html">Status</a><a href="/privacy.html">Privacy</a></nav>
+</div></header>
+<main class="wrap">
+  <h1>API reference</h1>
+  <p class="lead">Base URL <code>https://__HOST__/v1</code>. JSON in, JSON out. Bearer token in
+  <code>Authorization</code>. Everything is idempotent on <code>Idempotency-Key</code> except the
+  raw source upload.</p>
+
+  <h2>Assets</h2>
+  <table>
+    <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+    <tr><td>POST</td><td>/v1/assets</td><td>Create an asset shell</td></tr>
+    <tr><td>GET</td><td>/v1/assets</td><td>List, cursor paginated</td></tr>
+    <tr><td>GET</td><td>/v1/assets/{id}</td><td>Fetch one, includes state</td></tr>
+    <tr><td>PUT</td><td>/v1/assets/{id}/source</td><td>Upload the source bytes</td></tr>
+    <tr><td>POST</td><td>/v1/assets/{id}/retranscode</td><td>Re-run with another profile</td></tr>
+    <tr><td>DELETE</td><td>/v1/assets/{id}</td><td>Remove asset and renditions</td></tr>
+  </table>
+
+  <h3>States</h3>
+  <p><code>draft</code> → <code>uploaded</code> → <code>probing</code> → <code>transcoding</code> →
+  <code>ready</code>, or <code>failed</code> with a <code>reason</code> string. There is no
+  intermediate percentage; ask for <code>?expand=jobs</code> if you want per-rendition progress.</p>
+
+  <h3>Example</h3>
+  <pre><code>GET /v1/assets/__ASSET1__?expand=jobs
+
+{
+  "id": "__ASSET1__",
+  "state": "ready",
+  "duration_ms": __DURATION__,
+  "profile": "web-1080p",
+  "playback": "/p/__ASSET1__/master.m3u8",
+  "renditions": [
+    {"name":"1080p","bitrate_kbps":4500,"codec":"h264","ready":true},
+    {"name":"720p", "bitrate_kbps":2400,"codec":"h264","ready":true},
+    {"name":"480p", "bitrate_kbps":1100,"codec":"h264","ready":true}
+  ]
+}</code></pre>
+
+  <h3>Pull from a URL instead of uploading</h3>
+  <pre><code>POST /v1/assets
+{"profile":"web-1080p","source_url":"https://example.org/raw/reel.mov"}
+
+# -> {"id":"__ASSET2__","state":"probing"}</code></pre>
+  <p class="mut">The fetcher follows at most three redirects and refuses anything that is not
+  a direct media response.</p>
+
+  <h2>Profiles</h2>
+  <p>A profile is a named ladder in <code>config.toml</code>. Changing a profile does not touch
+  assets already transcoded with it — call <code>retranscode</code> for that.</p>
+  <pre><code>[profile.web-1080p]
+container = "hls"
+segment_seconds = 4
+ladder = [
+  { height = 1080, bitrate_kbps = 4500 },
+  { height =  720, bitrate_kbps = 2400 },
+  { height =  480, bitrate_kbps = 1100 },
+]
+audio = { codec = "aac", bitrate_kbps = 128 }</code></pre>
+
+  <h2>Playback</h2>
+  <p>Playback paths live outside <code>/v1</code> and are served as static files:
+  <code>/p/{asset}/master.m3u8</code> plus per-rendition playlists and <code>.m4s</code>
+  segments. Segments are immutable and safe to cache for a year; the master playlist is not.</p>
+
+  <h2>Webhooks</h2>
+  <table>
+    <tr><th>Event</th><th>When</th></tr>
+    <tr><td>asset.ready</td><td>All renditions written and playlist published</td></tr>
+    <tr><td>asset.failed</td><td>Probe or transcode gave up</td></tr>
+    <tr><td>storage.pressure</td><td>Free space under the configured floor</td></tr>
+  </table>
+  <p>Delivery is at-least-once with exponential backoff for six hours. Signature is
+  <code>X-Signature: sha256=&lt;hex&gt;</code> over the raw body.</p>
+
+  <h2>Errors</h2>
+  <table>
+    <tr><th>Code</th><th>Meaning</th></tr>
+    <tr><td>400 invalid_request</td><td>Body failed validation, see <code>field</code></td></tr>
+    <tr><td>401 unauthenticated</td><td>Missing or unknown token</td></tr>
+    <tr><td>409 wrong_state</td><td>Operation not legal in the asset's current state</td></tr>
+    <tr><td>413 source_too_large</td><td>Above <code>limits.max_source_bytes</code></td></tr>
+    <tr><td>422 undecodable</td><td>ffprobe found no usable video stream</td></tr>
+    <tr><td>429 slow_down</td><td>Per-token bucket empty, honour <code>Retry-After</code></td></tr>
+  </table>
+
+  <h2>Limits</h2>
+  <p>Defaults, all configurable: 32 GB per source, 8 concurrent transcodes, 600 API requests
+  per minute per token. Uploads are not counted against the API bucket.</p>
+</main>
+<footer><div class="wrap">
+  <span>__PROJECT_LC__ — __HOST__</span>
+  <a href="/">Home</a><a href="/status.html">Status</a><a href="/privacy.html">Privacy</a>
+  <span class="build">build __BUILD__</span>
+</div></footer>
+</body></html>

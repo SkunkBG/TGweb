@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__PROJECT__ — self-hosted video pipeline</title>
+<meta name="description" content="__PROJECT__ is a small self-hosted ingest, transcode and delivery service for video. Single binary, HTTP API, HLS output.">
+<link rel="stylesheet" href="/style.css">
+</head><body>
+<header><div class="wrap">
+  <div class="logo">__PROJECT_LC__<span>.</span></div>
+  <nav><a href="/docs.html">Docs</a><a href="/changelog.html">Changelog</a><a href="/status.html">Status</a><a href="/privacy.html">Privacy</a></nav>
+</div></header>
+<main class="wrap">
+  <h1>__H1__</h1>
+  <p class="lead">__PROJECT__ __LEAD__ It runs on the same box that serves the playback.</p>
+
+  <div class="grid">
+    <div class="card"><b>Ingest</b><p>Resumable multipart uploads and pull-from-URL. Probes the source, rejects what it cannot decode, keeps the original untouched.</p></div>
+    <div class="card"><b>Transcode</b><p>ffmpeg under the hood, ladder defined per profile. Hardware encode used when the host exposes it, software otherwise.</p></div>
+    <div class="card"><b>Deliver</b><p>HLS with byte-range segments, cache headers tuned for a plain reverse proxy or a CDN in front.</p></div>
+  </div>
+
+  <h2>Quick start</h2>
+  <pre><code>curl -sSL https://__HOST__/get | sh
+__PROJECT_LC__ init --data /var/lib/__PROJECT_LC__
+__PROJECT_LC__ serve --listen 127.0.0.1:8080</code></pre>
+  <p class="mut">Put your own TLS terminator in front. __PROJECT__ deliberately does not speak TLS.</p>
+
+  <h2>Push one file through it</h2>
+  <pre><code># create an asset
+curl -X POST https://__HOST__/v1/assets \
+     -H 'Authorization: Bearer $TOKEN' \
+     -d '{"profile":"web-1080p","title":"clip.mp4"}'
+
+# upload the source
+curl -X PUT https://__HOST__/v1/assets/__ASSET1__/source \
+     -H 'Authorization: Bearer $TOKEN' \
+     --data-binary @clip.mp4
+
+# poll until ready, then play
+curl https://__HOST__/v1/assets/__ASSET1__
+# -> {"state":"ready","playback":"/p/__ASSET1__/master.m3u8"}</code></pre>
+
+  <h2>Why it exists</h2>
+  <p>__WHY__</p>
+  <p>It is not a CDN, not a DRM stack and not a media asset manager. If you need signed
+  multi-region playback with per-viewer entitlements, this is the wrong tool. If you need
+  to turn a directory of camera files into something a browser can play, it does that and
+  stops there.</p>
+
+  <h2>Status</h2>
+  <p>Used in production for exactly one thing: the archive this domain was set up for.
+  The API is stable within a minor version; the on-disk layout is not yet. Read the
+  <a href="/docs.html">API reference</a> before wiring anything permanent to it, and the
+  <a href="/changelog.html">changelog</a> before upgrading.</p>
+</main>
+<footer><div class="wrap">
+  <span>__PROJECT_LC__ — __HOST__</span>
+  <a href="/docs.html">Docs</a><a href="/status.html">Status</a><a href="/privacy.html">Privacy</a>
+  <span class="build">build __BUILD__</span>
+</div></footer>
+</body></html>

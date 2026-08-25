@@ -1,0 +1,39 @@
+:root{
+  --bg:#0f1115; --panel:#161a21; --line:#242a34; --ink:#e6e9ef;
+  --dim:#9aa4b2; --accent:__ACCENT__; --ok:#4ec9a0;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+.wrap{max-width:920px;margin:0 auto;padding:0 22px}
+header{border-bottom:1px solid var(--line);background:#12151b}
+header .wrap{display:flex;align-items:center;gap:26px;height:58px}
+.logo{font-weight:650;letter-spacing:.02em}
+.logo span{color:var(--accent)}
+nav{display:flex;gap:20px;margin-left:auto;font-size:14px;flex-wrap:wrap}
+nav a{color:var(--dim)}
+h1{font-size:31px;line-height:1.2;margin:44px 0 12px;letter-spacing:-.01em}
+h2{font-size:20px;margin:38px 0 10px}
+h3{font-size:15px;margin:26px 0 6px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
+p{margin:0 0 14px;color:#cfd5df}
+.lead{font-size:17px;color:var(--dim);max-width:64ch}
+pre{background:#0b0d11;border:1px solid var(--line);border-radius:8px;padding:14px 16px;
+  overflow-x:auto;font-family:var(--mono);font-size:13px;line-height:1.55;color:#d7dee9}
+code{font-family:var(--mono);font-size:.92em;background:#1b2029;padding:1px 5px;border-radius:4px}
+pre code{background:none;padding:0}
+table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14px;display:block;overflow-x:auto}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--dim);font-weight:600}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));margin:22px 0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.card b{display:block;margin-bottom:5px}
+.card p{font-size:14px;color:var(--dim);margin:0}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--ok);margin-right:8px}
+.mut{color:var(--dim);font-size:14px}
+footer{border-top:1px solid var(--line);margin-top:56px;padding:22px 0 40px;color:var(--dim);font-size:13px}
+footer .wrap{display:flex;flex-wrap:wrap;gap:16px;align-items:center}
+footer a{color:var(--dim)}
+footer .build{margin-left:auto;font-family:var(--mono);opacity:.6}

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Privacy — __PROJECT__</title>
+<link rel="stylesheet" href="/style.css">
+</head><body>
+<header><div class="wrap">
+  <div class="logo">__PROJECT_LC__<span>.</span></div>
+  <nav><a href="/">Home</a><a href="/docs.html">Docs</a><a href="/changelog.html">Changelog</a><a href="/status.html">Status</a></nav>
+</div></header>
+<main class="wrap">
+  <h1>Privacy</h1>
+  <p class="lead">This is a personal project on a single rented server. The short version: no
+  analytics, no third-party scripts, no cookies, no ad or tracking pixels anywhere on this
+  domain.</p>
+
+  <h2>What is stored</h2>
+  <p>Media you upload, its derived renditions, and a row per asset with the metadata shown in
+  the API. Access logs keep timestamp, requested path, response code and byte count for
+  fourteen days, then rotate out. IP addresses are truncated before they hit disk.</p>
+
+  <h2>What is not</h2>
+  <p>No account profiles beyond an API token, no email lists, no session cookies, no
+  fingerprinting, no data sold or shared with anyone. There is no third-party embed on any page
+  here — the fonts are the ones already on your device.</p>
+
+  <h2>Deletion</h2>
+  <p>Delete an asset through the API and the renditions go with it on the next sweep, within an
+  hour. Ask by email and everything associated with a token gets wiped.</p>
+
+  <h2>Contact</h2>
+  <p>Write to <code>__EMAIL__</code>. This is a hobby project, so replies are best-effort, but
+  deletion requests get handled the same day.</p>
+
+  <p class="mut">Last updated when this page was deployed — build __BUILD__, __YEAR__.</p>
+</main>
+<footer><div class="wrap">
+  <span>__PROJECT_LC__ — __HOST__</span>
+  <a href="/">Home</a><a href="/docs.html">Docs</a>
+  <span class="build">build __BUILD__</span>
+</div></footer>
+</body></html>
