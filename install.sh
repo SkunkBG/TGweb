@@ -259,6 +259,57 @@ if [[ "$DRY_RUN" != "1" ]]; then
   fi
   [[ -x "$SRC_DIR/deploy/install.sh" ]] || chmod +x "$SRC_DIR/deploy/install.sh" 2>/dev/null || true
   [[ -f "$SRC_DIR/deploy/install.sh" ]] || die "В tproxy-server нет deploy/install.sh — структура изменилась, см. его README."
+
+  # ── Обход бага апстрима ─────────────────────────────────────────────────
+  # deploy/install.sh в строке 3 выставляет umask 077 и с этим umask запускает
+  # `go test ./...`. Тест TestLoadAcceptsSystemdCredentialReadPermissions
+  # создаёт фикстуру через os.WriteFile(..., 0444); под umask 077 она получает
+  # права 0400, проверка «profiles_file не должен быть доступен группе и
+  # остальным» не срабатывает — и негативная часть теста падает:
+  #   config_test.go:248: group/other-readable profiles file ... was accepted
+  # Из-за set -e установка обрывается до сборки. Возвращаем тестам обычный
+  # umask — остальные тесты при этом продолжают выполняться.
+  upstream_installer="$SRC_DIR/deploy/install.sh"
+  if [[ "${TGWEB_SKIP_UPSTREAM_TESTS:-0}" == "1" ]]; then
+    sed -i 's|^(cd "$repository" && \(umask 022 && \)\?"$go_binary" test \./\.\.\.)|# отключено TGWEB_SKIP_UPSTREAM_TESTS: \0|' \
+      "$upstream_installer"
+    warn "Тесты апстрима отключены (TGWEB_SKIP_UPSTREAM_TESTS=1)"
+  elif grep -q 'umask 022 && "$go_binary" test' "$upstream_installer"; then
+    info "Патч umask для go test уже применён"
+  elif grep -q '"$go_binary" test \./\.\.\.' "$upstream_installer"; then
+    sed -i 's|"$go_binary" test \./\.\.\.|umask 022 \&\& "$go_binary" test ./...|' "$upstream_installer"
+    ok "Патч: go test запускается с umask 022 (обход бага апстрима)"
+  else
+    warn "Строка с go test в апстриме не найдена — вероятно, баг уже исправлен."
+  fi
+
+  # ── Второй симптом того же umask 077 ────────────────────────────────────
+  # deploy/install-mtproxy.sh собирает MTProxy под тем же umask 077, поэтому
+  # objs/, objs/bin/ и сам бинарник создаются с правами 0700, а затем
+  # выполняется chown -R root:root. Сервис запускается под User=mtproxy и не
+  # может ни войти в каталог, ни выполнить файл — systemd отдаёт 203/EXEC и
+  # уходит в рестарт-луп. Проверка `test -x` в апстриме этого не ловит, она
+  # выполняется от root. Добавляем chmod перед chown.
+  mtproxy_installer="$SRC_DIR/deploy/install-mtproxy.sh"
+  if [[ -f "$mtproxy_installer" ]]; then
+    if grep -q 'chmod -R a+rX "$build_directory"' "$mtproxy_installer"; then
+      info "Патч прав MTProxy уже применён"
+    elif grep -q 'chown -R root:root "$build_directory"' "$mtproxy_installer"; then
+      sed -i 's|chown -R root:root "$build_directory"|chmod -R a+rX "$build_directory"\n\tchown -R root:root "$build_directory"|' \
+        "$mtproxy_installer"
+      ok "Патч: сборка MTProxy получает права, читаемые пользователем mtproxy"
+    else
+      warn "Строка chown в install-mtproxy.sh не найдена — вероятно, баг уже исправлен."
+    fi
+  fi
+
+  # Уже собранное дерево от предыдущего (сломанного) запуска тоже починим:
+  # апстрим не пересобирает MTProxy, если бинарник на месте, поэтому права
+  # 0700 остались бы навсегда.
+  if [[ -x /opt/MTProxy/objs/bin/mtproto-proxy ]]; then
+    chmod -R a+rX /opt/MTProxy
+    ok "Права на уже собранный /opt/MTProxy приведены в порядок"
+  fi
 fi
 
 # ───────────────────────── сборка сайта-прикрытия ────────────────────────

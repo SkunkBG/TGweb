@@ -58,8 +58,13 @@ fi
 # домен и секрет
 host=""
 if [[ -r /etc/tproxy-server/config.json ]]; then
-  host="$(grep -oE '"hostname"[[:space:]]*:[[:space:]]*"[^"]+"' /etc/tproxy-server/config.json 2>/dev/null \
-          | head -n1 | sed 's/.*"\([^"]*\)"$/\1/')"
+  # ключ в config.json называется public_hostname (см. config.example.json);
+  # "hostname" оставлен как запасной вариант на случай переименования
+  for key in public_hostname hostname; do
+    host="$(grep -oE "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]+\"" /etc/tproxy-server/config.json 2>/dev/null \
+            | head -n1 | sed 's/.*"\([^"]*\)"$/\1/')"
+    [[ -n "$host" ]] && break
+  done
 fi
 [[ -z "$host" && -r /etc/caddy/Caddyfile.tproxy ]] && \
   host="$(grep -oE '^[a-z0-9.-]+\.[a-z]{2,}' /etc/caddy/Caddyfile.tproxy 2>/dev/null | head -n1)"
@@ -72,16 +77,21 @@ if [[ -z "$secret" && -r "$PROFILES" ]]; then
 fi
 
 printf '\n%s  подключение%s\n' "$BOLD" "$OFF"
-if [[ -n "$host" && -n "$secret" ]]; then
+printf '    тип прокси   : WEB\n'
+if [[ -n "$host" ]]; then
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://$host/" 2>/dev/null || true)"
   [[ -n "$code" ]] || code="000"
-  printf '    сайт снаружи : https://%s/ -> %s\n' "$host" "$code"
-  printf '    тип прокси   : WEB\n'
   printf '    hostname     : %s%s%s\n' "$CYAN" "$host" "$OFF"
-  printf '    secret       : %s%s%s\n' "$CYAN" "$secret" "$OFF"
-  printf '\n    %shttps://t.me/webproxy?server=%s&secret=%s%s\n' "$GREEN" "$host" "$secret" "$OFF"
+  printf '    сайт снаружи : https://%s/ -> %s\n' "$host" "$code"
 else
-  printf '    Не удалось определить домен или секрет.\n'
-  printf '    Смотрите %s и %s\n' "$STATE_DIR/info.txt" "$PROFILES"
+  printf '    hostname     : не определён (смотрите /etc/tproxy-server/config.json)\n'
+fi
+if [[ -n "$secret" ]]; then
+  printf '    secret       : %s%s%s\n' "$CYAN" "$secret" "$OFF"
+else
+  printf '    secret       : не определён (смотрите %s и %s)\n' "$SECRET_FILE" "$PROFILES"
+fi
+if [[ -n "$host" && -n "$secret" ]]; then
+  printf '\n    %shttps://t.me/webproxy?server=%s&secret=%s%s\n' "$GREEN" "$host" "$secret" "$OFF"
 fi
 printf '\n'
