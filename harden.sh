@@ -13,12 +13,17 @@
 # nftables (inet tproxy_backend) висит на своём хуке и закрывает 2398/8888
 # снаружи. ufw работает в отдельной таблице, конфликта нет.
 #
-set -euo pipefail
+set -Eeuo pipefail
 
 SYSCTL_FILE="/etc/sysctl.d/99-tgweb.conf"
 JOURNALD_FILE="/etc/systemd/journald.conf.d/99-tgweb.conf"
 JAIL_FILE="/etc/fail2ban/jail.local"
 SWAPFILE="/swapfile"
+# Что именно было изменено — чтобы --revert возвращал прежнее состояние, а не
+# просто удалял свои файлы. Лежит в /var/lib, а не в /etc/tgweb: uninstall.sh
+# сносит /etc/tgweb вместе с прокси, а откат харденинга должен пережить это.
+STATE_DIR="/var/lib/tgweb"
+STATE_FILE="$STATE_DIR/harden.state"
 
 if [[ -t 1 ]]; then
   BOLD=$'\033[1m'; DIM=$'\033[2m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
@@ -26,13 +31,40 @@ if [[ -t 1 ]]; then
 else
   BOLD=''; DIM=''; GREEN=''; YELLOW=''; RED=''; OFF=''
 fi
-step() { printf '\n%s==> %s%s\n' "$BOLD" "$1" "$OFF"; }
+CURRENT_STEP="старт"
+step() { CURRENT_STEP="$1"; printf '\n%s==> %s%s\n' "$BOLD" "$1" "$OFF"; }
 ok()   { printf '  %sok%s   %s\n' "$GREEN" "$OFF" "$1"; }
 warn() { printf '  %s!!%s   %s\n' "$YELLOW" "$OFF" "$1"; }
 info() { printf '  %s·%s    %s\n' "$DIM" "$OFF" "$1"; }
 die()  { printf '\n  %sошибка:%s %s\n\n' "$RED" "$OFF" "$1" >&2; exit 1; }
 
-DO_FIREWALL=1; DO_FAIL2BAN=1; DO_TUNING=1; DO_EXTRAS=1; ASSUME_YES=0
+# Обрыв по set -e здесь опаснее, чем в install.sh: между сбросом ufw и его
+# включением сервер остаётся без файрвола, и человек должен узнать об этом
+# сразу, а не по оборванному выводу. die() уходит через exit и ERR не поднимает.
+on_error() {
+  local code="$1" line="$2" cmd="$3"
+  printf '\n  %sсорвалось%s на шаге «%s»\n' "$RED" "$OFF" "$CURRENT_STEP" >&2
+  printf '    строка %s, код выхода %s\n    команда: %s\n' "$line" "$code" "$cmd" >&2
+  case "$CURRENT_STEP" in
+    *"Файрвол"*)
+      printf '\n    %sНЕ ЗАКРЫВАЙТЕ ЭТУ СЕССИЮ.%s Правила могли остаться сброшенными,\n' "$RED" "$OFF" >&2
+      printf '    а ufw выключенным — сервер сейчас без файрвола. Проверьте:\n' >&2
+      printf '      ufw status verbose\n' >&2
+      printf '    Прежние правила ufw отложил в /etc/ufw/*.rules.<таймстамп>,\n' >&2
+      printf '    вернуть: mv /etc/ufw/user.rules.<таймстамп> /etc/ufw/user.rules && ufw reload\n' >&2 ;;
+    *"fail2ban"*)
+      printf '\n    Конфиг: %s, прежний рядом с суффиксом .bak.\n' "$JAIL_FILE" >&2
+      printf '    Проверка: fail2ban-client -t; журнал: journalctl -u fail2ban -n 40\n' >&2 ;;
+    *"тюнинг"*)
+      printf '\n    Откат: rm -f %s && sysctl --system\n' "$SYSCTL_FILE" >&2 ;;
+    *"Своп"*|*"журнал"*|*"Автообновления"*)
+      printf '\n    Файрвол и fail2ban к этому моменту уже настроены, это последний блок.\n' >&2 ;;
+  esac
+  printf '\n' >&2
+}
+trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
+DO_FIREWALL=1; DO_FAIL2BAN=1; DO_TUNING=1; DO_EXTRAS=1; ASSUME_YES=0; DO_REVERT=0
 usage() {
   cat <<EOF
 TGweb harden — защита и настройка сервера.
@@ -43,6 +75,7 @@ TGweb harden — защита и настройка сервера.
   --skip-fail2ban   не настраивать fail2ban
   --skip-tuning     не менять sysctl
   --skip-extras     не трогать своп, журнал и автообновления
+  --revert          вернуть состояние до harden.sh и выйти
   -y, --yes         без подтверждений
   -h, --help        справка
 EOF
@@ -53,6 +86,7 @@ while [[ $# -gt 0 ]]; do
     --skip-fail2ban) DO_FAIL2BAN=0; shift ;;
     --skip-tuning)   DO_TUNING=0; shift ;;
     --skip-extras)   DO_EXTRAS=0; shift ;;
+    --revert)        DO_REVERT=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "Неизвестный аргумент: $1 (см. --help)" ;;
@@ -66,6 +100,17 @@ confirm() {
   local a; IFS= read -r a || return 1
   case "${a:-}" in [yYдД]|[yY]es|да) return 0 ;; *) return 1 ;; esac
 }
+
+state_set() {   # ключ значение
+  mkdir -p "$STATE_DIR"; chmod 755 "$STATE_DIR"
+  [[ -e "$STATE_FILE" ]] || { : > "$STATE_FILE"; chmod 600 "$STATE_FILE"; }
+  if grep -q "^$1=" "$STATE_FILE"; then
+    sed -i "s|^$1=.*|$1=$2|" "$STATE_FILE"
+  else
+    printf '%s=%s\n' "$1" "$2" >> "$STATE_FILE"
+  fi
+}
+state_get() { [[ -r "$STATE_FILE" ]] && sed -n "s|^$1=||p" "$STATE_FILE" | tail -n1 || true; }
 
 printf '\n%s  TGweb harden%s  %sзащита и настройка сервера%s\n' "$BOLD" "$OFF" "$DIM" "$OFF"
 
@@ -120,6 +165,130 @@ apt_install() {
   apt-get install -y -qq "$@" >/dev/null
 }
 
+# ─────────────────────────────── откат ────────────────────────────────────
+if [[ $DO_REVERT -eq 1 ]]; then
+  step "Откат изменений harden.sh"
+  if [[ -r "$STATE_FILE" ]]; then
+    ok "Состояние прочитано из $STATE_FILE"
+  else
+    warn "Файла состояния нет (harden.sh запускался старой версией?)."
+    warn "Верну только то, что можно определить по самим файлам."
+  fi
+
+  # 1. ufw — самое опасное место отката, поэтому запереться здесь нельзя
+  ufw_ext="$(state_get ufw_backup_ext)"
+  ufw_was="$(state_get ufw_was_active)"
+  if [[ -n "$ufw_ext" ]] && compgen -G "/etc/ufw/*.rules.$ufw_ext" >/dev/null; then
+    if confirm "Вернуть правила ufw из бэкапа $ufw_ext?"; then
+      n=0
+      for f in /etc/ufw/*.rules."$ufw_ext"; do
+        mv -f "$f" "${f%".$ufw_ext"}" && n=$((n + 1))
+      done
+      ok "Файлов правил возвращено: $n"
+      if [[ "$ufw_was" == "1" ]]; then
+        ufw reload >/dev/null 2>&1 || true
+        # в прежних правилах могло не быть текущего SSH-порта — не запираемся
+        for p in "${ssh_ports[@]}"; do
+          if ! ufw status 2>/dev/null | grep -q "^$p/tcp"; then
+            ufw limit "$p/tcp" comment 'SSH (добавлено при откате)' >/dev/null
+            warn "В прежних правилах не было SSH-порта $p — добавил, чтобы не отрезать доступ"
+          fi
+        done
+        ok "ufw перезагружен (до harden.sh он был активен)"
+      else
+        ufw --force disable >/dev/null 2>&1 || true
+        ok "ufw выключен — до harden.sh он активен не был"
+      fi
+    else
+      info "Правила ufw оставлены как есть"
+    fi
+  else
+    warn "Бэкапа правил ufw не нашлось — файрвол не трогаю"
+  fi
+
+  # 2. fail2ban
+  jail_backup="$(state_get jail_backup)"
+  if [[ -n "$jail_backup" && -e "$jail_backup" ]]; then
+    mv -f "$jail_backup" "$JAIL_FILE" && ok "Возвращён прежний $JAIL_FILE"
+  elif [[ -e "$JAIL_FILE" ]] && grep -q 'Создано TGweb harden.sh' "$JAIL_FILE"; then
+    rm -f "$JAIL_FILE" && ok "Удалён $JAIL_FILE (его написал harden.sh)"
+  else
+    info "jail.local отсутствует или написан не нами — не трогаю"
+  fi
+  if systemctl is-active --quiet fail2ban 2>/dev/null; then
+    systemctl restart fail2ban >/dev/null 2>&1 \
+      && ok "fail2ban перезапущен" \
+      || warn "fail2ban не перезапустился: journalctl -u fail2ban -n 40"
+  fi
+
+  # 3. sysctl
+  if [[ -e "$SYSCTL_FILE" ]]; then
+    rm -f "$SYSCTL_FILE"
+    ok "Удалён $SYSCTL_FILE"
+    sysctl --system >/dev/null 2>&1 || true
+    # удаление файла не возвращает уже применённые значения — делаем это явно
+    prev_cc="$(state_get prev_cc)"; prev_qd="$(state_get prev_qdisc)"
+    if [[ -n "$prev_cc" ]]; then
+      sysctl -qw net.ipv4.tcp_congestion_control="$prev_cc" 2>/dev/null \
+        && ok "congestion control возвращён: $prev_cc" || warn "не удалось вернуть congestion control"
+    fi
+    if [[ -n "$prev_qd" ]]; then
+      sysctl -qw net.core.default_qdisc="$prev_qd" 2>/dev/null \
+        && ok "qdisc возвращён: $prev_qd" || warn "не удалось вернуть qdisc"
+    fi
+    info "Прочие параметры вернутся к значениям ядра после перезагрузки"
+  else
+    info "$SYSCTL_FILE отсутствует — тюнинг откатывать нечего"
+  fi
+
+  # 4. журнал
+  if [[ -e "$JOURNALD_FILE" ]]; then
+    rm -f "$JOURNALD_FILE"
+    ok "Удалён $JOURNALD_FILE"
+    if confirm "Перезапустить systemd-journald, чтобы прежний лимит вступил в силу?"; then
+      systemctl restart systemd-journald 2>/dev/null || true
+      ok "journald перезапущен"
+    else
+      info "Прежний лимит вернётся после перезагрузки"
+    fi
+  fi
+
+  # 5. своп — единственное, что удаляет данные, поэтому отдельным вопросом
+  if [[ "$(state_get swap_created)" == "1" ]]; then
+    if confirm "Отключить и удалить своп-файл $SWAPFILE (его создал harden.sh)?"; then
+      swapoff "$SWAPFILE" 2>/dev/null || true
+      # /etc/fstab правим через временный файл и с копией: сломанный fstab
+      # стоит загрузки, и regexp-правка на месте здесь того не стоит
+      if grep -q "^$SWAPFILE " /etc/fstab; then
+        cp -a /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
+        grep -v "^$SWAPFILE " /etc/fstab > /etc/fstab.tgweb.tmp || true
+        if [[ -s /etc/fstab.tgweb.tmp ]]; then
+          mv /etc/fstab.tgweb.tmp /etc/fstab
+          ok "Строка свопа убрана из /etc/fstab (копия рядом с суффиксом .bak)"
+        else
+          rm -f /etc/fstab.tgweb.tmp
+          warn "После удаления строки /etc/fstab оказался бы пуст — не трогаю его"
+        fi
+      fi
+      rm -f "$SWAPFILE"
+      ok "Своп отключён, файл удалён"
+    else
+      info "Своп оставлен как есть"
+    fi
+  fi
+
+  # 6. автообновления не откатываем: это ослабило бы защиту без просьбы
+  if [[ -e /etc/apt/apt.conf.d/20auto-upgrades ]]; then
+    info "Автообновления безопасности оставлены включёнными намеренно."
+    info "Если они всё-таки не нужны: rm /etc/apt/apt.conf.d/20auto-upgrades"
+  fi
+
+  printf '\n  Откат завершён. Состояние: %s\n' "$STATE_FILE"
+  printf '  %sПроверьте доступ вторым окном, не закрывая это:%s ssh -p %s %s@<сервер>\n\n' \
+    "$YELLOW" "$OFF" "${ssh_ports[0]}" "${SUDO_USER:-$(id -un)}"
+  exit 0
+fi
+
 # ──────────────────────────────── 1. ufw ──────────────────────────────────
 if [[ $DO_FIREWALL -eq 1 ]]; then
   step "Файрвол (ufw)"
@@ -131,10 +300,31 @@ if [[ $DO_FIREWALL -eq 1 ]]; then
   for p in "${ssh_ports[@]}"; do
     printf '    разрешить : %s/tcp (SSH, с ограничением частоты)\n' "$p"
   done
-  printf '    разрешить : 80/tcp, 443/tcp (Caddy)\n\n'
+  printf '    разрешить : 80/tcp, 443/tcp (Caddy)\n'
+
+  # Раньше сброс шёл молча, и человек не видел, что теряет. ufw переносит
+  # текущие файлы правил в /etc/ufw/*.rules.<таймстамп> (src/backend_iptables.py),
+  # так что откат есть — но сказать об этом надо до, а не после.
+  ufw_was_active=0
+  ufw status 2>/dev/null | grep -q '^Status: active' && ufw_was_active=1
+  existing="$(ufw status numbered 2>/dev/null | sed -n '/^\[/p' || true)"
+  if [[ -n "$existing" ]]; then
+    printf '\n  %sТекущие правила будут сброшены%s — сейчас их %s:\n' \
+      "$YELLOW" "$OFF" "$(printf '%s\n' "$existing" | wc -l | tr -d ' ')"
+    printf '%s\n' "$existing" | sed 's/^/       /'
+    printf '    Копии останутся в /etc/ufw/*.rules.<таймстамп>\n'
+  fi
+  printf '\n'
 
   if confirm "Применить?"; then
-    ufw --force reset >/dev/null 2>&1 || true
+    # на несколько секунд между reset и enable сервер остаётся без файрвола
+    reset_out="$(ufw --force reset 2>&1 || true)"
+    printf '%s\n' "$reset_out" | grep -i "backing up" | sed 's/^/       /' || true
+    # суффикс бэкапа берём из вывода самого ufw, а не выдумываем формат
+    ufw_ext="$(printf '%s\n' "$reset_out" \
+               | sed -n "s|.*to '/etc/ufw/user\.rules\.\([0-9_]*\)'.*|\\1|p" | head -n1)"
+    state_set ufw_was_active "$ufw_was_active"
+    state_set ufw_backup_ext "$ufw_ext"
     ufw default deny incoming >/dev/null
     ufw default allow outgoing >/dev/null
     for p in "${ssh_ports[@]}"; do ufw limit "$p/tcp" comment 'SSH' >/dev/null; done
@@ -196,8 +386,13 @@ if [[ $DO_FAIL2BAN -eq 1 ]]; then
   ignore="127.0.0.1/8 ::1"
   [[ -n "$admin_ip" ]] && ignore="$ignore $admin_ip"
 
-  [[ -e "$JAIL_FILE" ]] && cp -a "$JAIL_FILE" "$JAIL_FILE.bak.$(date +%Y%m%d%H%M%S)" \
-    && info "Прежний jail.local сохранён рядом с суффиксом .bak"
+  jail_backup=""
+  if [[ -e "$JAIL_FILE" ]]; then
+    jail_backup="$JAIL_FILE.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "$JAIL_FILE" "$jail_backup"
+    info "Прежний jail.local сохранён как ${jail_backup##*/}"
+  fi
+  state_set jail_backup "$jail_backup"
 
   cat > "$JAIL_FILE" <<EOF
 # Создано TGweb harden.sh — правьте свободно, скрипт делает резервную копию.
@@ -269,6 +464,9 @@ fi
 # ─────────────────────────── 3. сетевой тюнинг ────────────────────────────
 if [[ $DO_TUNING -eq 1 ]]; then
   step "Сетевой тюнинг"
+  # запоминаем до правки: после удаления drop-in ядро само их не вернёт
+  state_set prev_cc "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  state_set prev_qdisc "$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
   modprobe tcp_bbr 2>/dev/null || true
   bbr_ok=0
   grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null && bbr_ok=1
@@ -338,6 +536,7 @@ if [[ $DO_EXTRAS -eq 1 ]]; then
         mkswap "$SWAPFILE" >/dev/null
         swapon "$SWAPFILE"
         grep -q "^$SWAPFILE " /etc/fstab || printf '%s none swap sw 0 0\n' "$SWAPFILE" >> /etc/fstab
+        state_set swap_created 1
         ok "Своп 1 ГБ подключён и прописан в /etc/fstab"
       else
         warn "Не удалось создать своп-файл"
@@ -358,8 +557,23 @@ SystemMaxUse=200M
 SystemMaxFileSize=20M
 MaxRetentionSec=1month
 EOF
-  systemctl restart systemd-journald 2>/dev/null || true
-  ok "journald ограничен 200 МБ ($JOURNALD_FILE)"
+  state_set journald_created 1
+  ok "Записан $JOURNALD_FILE (лимит 200 МБ)"
+  # Место освобождаем сразу и без рестарта — это безопасно.
+  if journalctl --vacuum-size=200M >/dev/null 2>&1; then
+    ok "Журнал ужат до 200 МБ прямо сейчас (journalctl --vacuum-size)"
+  fi
+  # А вот сам лимит journald читает только при старте. Рестарт при этом рвёт
+  # stdout-потоки уже запущенных юнитов: их вывод пропадёт из журнала до
+  # собственного рестарта. Поэтому спрашиваем, а не делаем молча.
+  if confirm "Перезапустить systemd-journald, чтобы лимит действовал уже сейчас?"; then
+    systemctl restart systemd-journald 2>/dev/null || true
+    ok "journald перезапущен, лимит в силе"
+    info "Сервисы, писавшие в журнал через stdout, стоит перезапустить, иначе"
+    info "их вывод не попадёт в журнал до следующего рестарта."
+  else
+    info "Лимит вступит в силу после перезагрузки — файл на месте, ничего делать не надо"
+  fi
 
   step "Автообновления безопасности"
   if confirm "Включить unattended-upgrades?"; then
@@ -393,6 +607,6 @@ cat <<EOF
     bash status.sh                               # состояние прокси
 
 ${YELLOW}  Не закрывайте эту сессию,${OFF} пока не проверите вход вторым окном:
-    ssh -p ${ssh_ports[0]} $(id -un)@<адрес сервера>
+    ssh -p ${ssh_ports[0]} ${SUDO_USER:-$(id -un)}@<адрес сервера>
 
 EOF

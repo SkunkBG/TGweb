@@ -9,10 +9,16 @@
 #   sudo bash install.sh --hostname proxy.example.com --email you@example.com \
 #                        --project Soul --yes
 #
-set -euo pipefail
+set -Eeuo pipefail
 
 VERSION="1.0.0"
 UPSTREAM_REPO="https://github.com/telegramdesktop/tproxy-server.git"
+# Пусто — ветка по умолчанию у remote (у апстрима это master, но имя может
+# смениться, поэтому не зашиваем). Эта ветка движется, а её код собирается и
+# запускается от root, и три патча ниже привязаны к её текущему виду. Флаг
+# --upstream-ref фиксирует проверенный коммит или тег; собранный SHA всегда
+# печатается и попадает в info.txt, чтобы было видно, что именно установлено.
+UPSTREAM_REF=""
 SRC_DIR="/opt/tproxy-src"
 BUILD_DIR="/opt/tgweb-site"
 STATE_DIR="/etc/tgweb"
@@ -22,6 +28,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SITE_SRC="$SCRIPT_DIR/site"
 DRY_RUN="${TGWEB_DRY_RUN:-0}"
 
+# Признак того, что установщик апстрима здесь уже отработал. Меняет две вещи:
+# занятые Caddy порты 80/443 перестают быть конфликтом, и рабочую копию сайта
+# приходится обновлять самим (см. ниже).
+REINSTALL=0
+[[ -f /etc/tproxy-server/config.json ]] && REINSTALL=1
+
 # ─────────────────────────────── оформление ───────────────────────────────
 if [[ -t 1 ]]; then
   BOLD=$'\033[1m'; DIM=$'\033[2m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
@@ -29,11 +41,38 @@ if [[ -t 1 ]]; then
 else
   BOLD=''; DIM=''; GREEN=''; YELLOW=''; RED=''; CYAN=''; OFF=''
 fi
-step() { printf '\n%s==> %s%s\n' "$BOLD" "$1" "$OFF"; }
+CURRENT_STEP="старт"
+step() { CURRENT_STEP="$1"; printf '\n%s==> %s%s\n' "$BOLD" "$1" "$OFF"; }
 ok()   { printf '  %sok%s   %s\n' "$GREEN" "$OFF" "$1"; }
 warn() { printf '  %s!!%s   %s\n' "$YELLOW" "$OFF" "$1"; }
 info() { printf '  %s·%s    %s\n' "$DIM" "$OFF" "$1"; }
 die()  { printf '\n  %sошибка:%s %s\n\n' "$RED" "$OFF" "$1" >&2; exit 1; }
+
+# Без этого set -e обрывает установку молча: человек видит оборванный вывод и
+# не знает, на чём именно всё встало. Трап называет шаг, строку и команду.
+# die() уходит через exit и ERR не поднимает, так что двойных сообщений нет.
+on_error() {
+  local code="$1" line="$2" cmd="$3"
+  printf '\n  %sсорвалось%s на шаге «%s»\n' "$RED" "$OFF" "$CURRENT_STEP" >&2
+  printf '    строка %s, код выхода %s\n' "$line" "$code" >&2
+  printf '    команда: %s\n' "$cmd" >&2
+  case "$CURRENT_STEP" in
+    *"зависимост"*)
+      printf '\n    Похоже на apt. Проверьте: apt-get update && apt-get -f install\n' >&2 ;;
+    *"Получение tproxy-server"*)
+      printf '\n    Проверьте доступ к апстриму: git ls-remote %s\n' "$UPSTREAM_REPO" >&2 ;;
+    *"Сборка сайта"*)
+      printf '\n    Сайт собирается в %s, установка ещё не начиналась —\n' "$BUILD_DIR" >&2
+      printf '    система не изменена, можно спокойно запускать заново.\n' >&2 ;;
+    *"Caddy + relay + MTProxy"*)
+      printf '\n    Установщик апстрима не завершился. Смотрите:\n' >&2
+      printf '      journalctl -u caddy -u tproxy-server -u mtproxy -n 50 --no-pager\n' >&2
+      printf '    Повторный запуск безопасен: секрет сохранён в %s,\n' "$SECRET_FILE" >&2
+      printf '    ссылка на прокси не изменится.\n' >&2 ;;
+  esac
+  printf '\n' >&2
+}
+trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
 # ──────────────────────────── разбор аргументов ───────────────────────────
 FQDN=""; EMAIL=""; PROJECT=""; SECRET=""; WORKERS=""; ASSUME_YES=0; SKIP_DNS=0
@@ -50,6 +89,8 @@ TGweb $VERSION — установка Telegram WEB-прокси с сайтом-
   --project NAME       название проекта для сайта-прикрытия
   --secret HEX         32 hex-символа (по умолчанию генерируется случайный)
   --workers N          воркеров MTProxy (по умолчанию по числу ядер, максимум 4)
+  --upstream-ref REF   ветка, тег или коммит tproxy-server
+                       (по умолчанию — ветка по умолчанию у апстрима)
   --skip-dns-check     не сверять A-запись с внешним IP
   -y, --yes            не спрашивать подтверждение
   -h, --help           эта справка
@@ -63,6 +104,7 @@ while [[ $# -gt 0 ]]; do
     --project) PROJECT="${2:-}"; shift 2 ;;
     --secret) SECRET="${2:-}"; shift 2 ;;
     --workers) WORKERS="${2:-}"; shift 2 ;;
+    --upstream-ref) UPSTREAM_REF="${2:-}"; shift 2 ;;
     --skip-dns-check) SKIP_DNS=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -75,7 +117,9 @@ printf '\n%s  TGweb %s%s  %sTelegram WEB-прокси + сайт-прикрыт�
 
 # ──────────────────────────── проверки системы ────────────────────────────
 step "Проверка системы"
-[[ $EUID -eq 0 ]] || die "Нужны права root. Запустите: sudo bash install.sh"
+if [[ "$DRY_RUN" != "1" ]]; then
+  [[ $EUID -eq 0 ]] || die "Нужны права root. Запустите: sudo bash install.sh"
+fi
 [[ -d "$SITE_SRC" ]] || die "Не найден каталог site/ рядом со скриптом.
      Запускайте install.sh из корня клонированного репозитория."
 [[ -f "$SITE_SRC/index.html" ]] || die "В site/ нет index.html — это обязательный файл."
@@ -157,6 +201,8 @@ if [[ -n "$SECRET" ]]; then
   info "Секрет взят из --secret"
 elif [[ -s "$SECRET_FILE" ]]; then
   SECRET="$(tr -d '[:space:]' < "$SECRET_FILE")"
+  [[ "$SECRET" =~ ^(dd)?[0-9a-f]{32}$ ]] || die "В $SECRET_FILE лежит не 32 hex-символа.
+     Задайте секрет явно (--secret HEX) или удалите файл, чтобы сгенерировать новый."
   info "Найден сохранённый секрет в $SECRET_FILE — переиспользую (ссылка не изменится)"
 else
   SECRET="$(openssl rand -hex 16 2>/dev/null || head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
@@ -196,8 +242,8 @@ if [[ "$DRY_RUN" != "1" ]]; then
   step "Установка зависимостей"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq git curl ca-certificates openssl dnsutils iproute2 >/dev/null
-  ok "git, curl, openssl, dig, ss"
+  apt-get install -y -qq git curl ca-certificates openssl dnsutils iproute2 python3 >/dev/null
+  ok "git, curl, openssl, dig, ss, python3"
 fi
 
 # ────────────────────────────── проверка DNS ──────────────────────────────
@@ -207,14 +253,70 @@ if [[ "$DRY_RUN" != "1" ]]; then
     warn "Проверка пропущена (--skip-dns-check)"
   else
     myip="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || echo '')"
-    resolved="$(dig +short A "$FQDN" @1.1.1.1 2>/dev/null | tail -n1 || true)"
-    if [[ -z "$resolved" ]]; then
-      die "A-запись для $FQDN не найдена.
-     Создайте у DNS-провайдера запись A на IP этого сервера${myip:+ ($myip)},
-     дождитесь распространения и запустите скрипт снова.
+
+    # dig +short молчит одинаково и когда записи нет, и когда резолвер
+    # недоступен. Разница принципиальная: в первом случае человек правит зону,
+    # во втором провайдер режет исходящий DNS и правка зоны не поможет.
+    # Поэтому смотрим на статус ответа и обходим несколько резолверов.
+    dig_a() {
+      local server="$1" type="$2"
+      if [[ -n "$server" ]]; then
+        dig +time=3 +tries=1 "$server" "$type" "$FQDN" 2>/dev/null
+      else
+        dig +time=3 +tries=1 "$type" "$FQDN" 2>/dev/null
+      fi
+    }
+
+    dns_status=""; resolved=""; used_resolver=""
+    for server in "@1.1.1.1" "@9.9.9.9" ""; do
+      answer="$(dig_a "$server" A || true)"
+      status="$(printf '%s\n' "$answer" | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -n1)"
+      [[ -z "$status" ]] && continue          # этот резолвер не ответил вовсе
+      # в сообщениях ссылаемся на того, кто ответил первым...
+      if [[ -z "$dns_status" ]]; then
+        dns_status="$status"; used_resolver="${server:-системный}"
+      fi
+      # берём именно A из ANSWER: при цепочке CNAME последняя строка не адрес
+      resolved="$(printf '%s\n' "$answer" | awk '$4=="A"{print $5}' | head -n1)"
+      # ...но если запись нашлась только у следующего — верим ему
+      if [[ -n "$resolved" ]]; then
+        dns_status="$status"; used_resolver="${server:-системный}"
+        break
+      fi
+    done
+
+    # последний шанс: штатный резолвер libc, если 53/UDP закрыт именно для dig
+    if [[ -z "$dns_status" ]]; then
+      resolved="$(getent ahostsv4 "$FQDN" 2>/dev/null | awk '{print $1; exit}' || true)"
+      [[ -n "$resolved" ]] && { dns_status="NOERROR"; used_resolver="getent"; }
+    fi
+
+    if [[ -z "$dns_status" ]]; then
+      die "Ни один DNS-резолвер не ответил: 1.1.1.1, 9.9.9.9, системный, getent.
+     Похоже на блокировку исходящего DNS, а не на отсутствие записи —
+     правка зоны у провайдера тут не поможет. Проверьте руками:
+       dig A $FQDN @1.1.1.1
      Обойти проверку: --skip-dns-check"
     fi
-    ok "$FQDN -> $resolved"
+
+    if [[ "$dns_status" == "NXDOMAIN" ]]; then
+      die "Домена $FQDN не существует (NXDOMAIN, ответил $used_resolver).
+     Создайте запись A на IP этого сервера${myip:+ ($myip)} и дождитесь распространения.
+     Обойти проверку: --skip-dns-check"
+    fi
+
+    if [[ -z "$resolved" ]]; then
+      aaaa="$(dig_a "@1.1.1.1" AAAA | awk '$4=="AAAA"{print $5}' | head -n1 || true)"
+      die "У $FQDN нет A-записи (ответ $dns_status от $used_resolver).${aaaa:+
+     Нашлась только AAAA ($aaaa), а ACME и Telegram придут по IPv4.}
+     Создайте запись A на IP этого сервера${myip:+ ($myip)}.
+     Обойти проверку: --skip-dns-check"
+    fi
+
+    [[ "$resolved" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] \
+      || die "Резолвер $used_resolver вернул не IPv4-адрес: $resolved"
+
+    ok "$FQDN -> $resolved (резолвер $used_resolver)"
     if [[ -n "$myip" && "$resolved" != "$myip" ]]; then
       warn "Внешний IP сервера $myip не совпадает с A-записью $resolved."
       warn "Если домен за Cloudflare — ОТКЛЮЧИТЕ проксирование (серая тучка, DNS only):"
@@ -228,14 +330,23 @@ if [[ "$DRY_RUN" != "1" ]]; then
   fi
 
   step "Проверка портов 80 и 443"
+  # Повторный запуск ради обновления сайта — штатный сценарий, и порты в этот
+  # момент держит наш же Caddy. Чужой слушатель по-прежнему повод остановиться.
+  busy=0
   for p in 80 443; do
-    if ss -lnt "sport = :$p" 2>/dev/null | grep -q LISTEN; then
-      holder="$(ss -lntp "sport = :$p" 2>/dev/null | awk 'NR==2{print $NF}')"
-      die "Порт $p занят: ${holder:-неизвестно}
-     Наружу должен слушать только Caddy. Например: systemctl disable --now nginx"
+    ss -lnt "sport = :$p" 2>/dev/null | grep -q LISTEN || continue
+    busy=1
+    holders="$(ss -lntpH "sport = :$p" 2>/dev/null \
+               | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | sort -u | tr '\n' ' ')"
+    holders="${holders% }"          # хвостовой пробел от tr
+    if [[ "$holders" == "caddy" && $REINSTALL -eq 1 ]]; then
+      info "Порт $p держит Caddy этой же установки — это повторный запуск"
+      continue
     fi
+    die "Порт $p занят: ${holders:-неизвестно}
+     Наружу должен слушать только Caddy. Например: systemctl disable --now nginx"
   done
-  ok "80 и 443 свободны"
+  [[ $busy -eq 0 ]] && ok "80 и 443 свободны" || ok "80 и 443 заняты своим Caddy"
 
   if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
     ufw allow 80/tcp >/dev/null 2>&1 || true
@@ -247,16 +358,28 @@ fi
 # ───────────────────────── исходники tproxy-server ───────────────────────
 if [[ "$DRY_RUN" != "1" ]]; then
   step "Получение tproxy-server"
-  if [[ -d "$SRC_DIR/.git" ]]; then
-    git -C "$SRC_DIR" fetch --depth 1 origin >/dev/null 2>&1 || true
-    git -C "$SRC_DIR" reset --hard FETCH_HEAD >/dev/null 2>&1 || true
-    ok "Обновлён: $SRC_DIR"
-  else
+  if [[ ! -d "$SRC_DIR/.git" ]]; then
     rm -rf "$SRC_DIR"
     git clone --depth 1 "$UPSTREAM_REPO" "$SRC_DIR" >/dev/null 2>&1 \
       || die "Не удалось склонировать $UPSTREAM_REPO — проверьте выход в интернет."
-    ok "Склонирован в $SRC_DIR"
   fi
+  # ref берём явно: raw-SHA GitHub тоже отдаёт, так что подойдёт и ветка,
+  # и тег, и коммит. Прежняя версия глушила ошибку fetch, и при обрыве сети
+  # собиралось молча то, что уже лежало на диске.
+  if [[ -n "$UPSTREAM_REF" ]]; then
+    git -C "$SRC_DIR" fetch --depth 1 origin "$UPSTREAM_REF" >/dev/null 2>&1 \
+      || die "Не удалось получить «$UPSTREAM_REF» из $UPSTREAM_REPO.
+     Проверьте сеть и что такая ветка, тег или коммит там есть."
+  else
+    git -C "$SRC_DIR" fetch --depth 1 origin >/dev/null 2>&1 \
+      || die "Не удалось обновить $SRC_DIR из $UPSTREAM_REPO — проверьте выход в интернет."
+  fi
+  git -C "$SRC_DIR" reset --hard FETCH_HEAD >/dev/null 2>&1 \
+    || die "Не удалось переключить $SRC_DIR на ${UPSTREAM_REF:-ветку по умолчанию}."
+  UPSTREAM_SHA="$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+  ok "tproxy-server: ${UPSTREAM_REF:-ветка по умолчанию} @ ${UPSTREAM_SHA:0:12} ($SRC_DIR)"
+  [[ -z "$UPSTREAM_REF" ]] && \
+    info "Ветка движется без предупреждения; зафиксировать: --upstream-ref ${UPSTREAM_SHA:0:12}"
   [[ -x "$SRC_DIR/deploy/install.sh" ]] || chmod +x "$SRC_DIR/deploy/install.sh" 2>/dev/null || true
   [[ -f "$SRC_DIR/deploy/install.sh" ]] || die "В tproxy-server нет deploy/install.sh — структура изменилась, см. его README."
 
@@ -269,18 +392,38 @@ if [[ "$DRY_RUN" != "1" ]]; then
   #   config_test.go:248: group/other-readable profiles file ... was accepted
   # Из-за set -e установка обрывается до сборки. Возвращаем тестам обычный
   # umask — остальные тесты при этом продолжают выполняться.
+  # Каждый sed ниже правит чужой файл вслепую, поэтому результат проверяется
+  # grep-ом: молча не применившийся патч дороже честной ошибки.
   upstream_installer="$SRC_DIR/deploy/install.sh"
+
+  tests_disabled=0
   if [[ "${TGWEB_SKIP_UPSTREAM_TESTS:-0}" == "1" ]]; then
-    sed -i 's|^(cd "$repository" && \(umask 022 && \)\?"$go_binary" test \./\.\.\.)|# отключено TGWEB_SKIP_UPSTREAM_TESTS: \0|' \
+    sed -i 's|^(cd "$repository" && \(umask 022 && \)\?"$go_binary" test \./\.\.\.)|# отключено TGWEB_SKIP_UPSTREAM_TESTS: &|' \
       "$upstream_installer"
-    warn "Тесты апстрима отключены (TGWEB_SKIP_UPSTREAM_TESTS=1)"
-  elif grep -q 'umask 022 && "$go_binary" test' "$upstream_installer"; then
-    info "Патч umask для go test уже применён"
-  elif grep -q '"$go_binary" test \./\.\.\.' "$upstream_installer"; then
-    sed -i 's|"$go_binary" test \./\.\.\.|umask 022 \&\& "$go_binary" test ./...|' "$upstream_installer"
-    ok "Патч: go test запускается с umask 022 (обход бага апстрима)"
-  else
-    warn "Строка с go test в апстриме не найдена — вероятно, баг уже исправлен."
+    if grep -q '^# отключено TGWEB_SKIP_UPSTREAM_TESTS' "$upstream_installer"; then
+      tests_disabled=1
+      warn "Тесты апстрима отключены (TGWEB_SKIP_UPSTREAM_TESTS=1)"
+    else
+      warn "TGWEB_SKIP_UPSTREAM_TESTS=1, но строку с go test закомментировать не вышло —"
+      warn "апстрим изменил её вид. Пробую вместо этого патч umask."
+    fi
+  fi
+
+  if [[ $tests_disabled -eq 0 ]]; then
+    if grep -q 'umask 022 && "$go_binary" test' "$upstream_installer"; then
+      info "Патч umask для go test уже применён"
+    elif grep -q '"$go_binary" test \./\.\.\.' "$upstream_installer"; then
+      sed -i 's|"$go_binary" test \./\.\.\.|umask 022 \&\& "$go_binary" test ./...|' "$upstream_installer"
+      if grep -q 'umask 022 && "$go_binary" test' "$upstream_installer"; then
+        ok "Патч: go test запускается с umask 022 (обход бага апстрима)"
+      else
+        die "Патч umask не применился к $upstream_installer.
+     Тесты апстрима упадут на правах фикстуры и оборвут установку.
+     Обход: TGWEB_SKIP_UPSTREAM_TESTS=1 sudo -E bash install.sh ..."
+      fi
+    else
+      warn "Строка с go test в апстриме не найдена — вероятно, баг уже исправлен."
+    fi
   fi
 
   # ── Второй симптом того же umask 077 ────────────────────────────────────
@@ -297,7 +440,12 @@ if [[ "$DRY_RUN" != "1" ]]; then
     elif grep -q 'chown -R root:root "$build_directory"' "$mtproxy_installer"; then
       sed -i 's|chown -R root:root "$build_directory"|chmod -R a+rX "$build_directory"\n\tchown -R root:root "$build_directory"|' \
         "$mtproxy_installer"
-      ok "Патч: сборка MTProxy получает права, читаемые пользователем mtproxy"
+      if grep -q 'chmod -R a+rX "$build_directory"' "$mtproxy_installer"; then
+        ok "Патч: сборка MTProxy получает права, читаемые пользователем mtproxy"
+      else
+        warn "Патч прав MTProxy НЕ применился — каталог сборки останется 0700."
+        warn "Права будут поправлены после установки, но проверьте $mtproxy_installer."
+      fi
     else
       warn "Строка chown в install-mtproxy.sh не найдена — вероятно, баг уже исправлен."
     fi
@@ -354,20 +502,37 @@ BUILD_ID="$(rand_hex 4)"
 ASSET1="as_$(rand_hex 4)"
 ASSET2="as_$(rand_hex 4)"
 DURATION="$(( (RANDOM % 900 + 120) * 1000 + RANDOM % 999 ))"
-PROJECT_LC="$(printf '%s' "$PROJECT" | tr '[:upper:]' '[:lower:]')"
+# PROJECT_LC уходит в логотип, но и в примеры команд и в имя каталога на
+# страницах, поэтому это должен быть идентификатор: название проекта может
+# содержать пробелы и что угодно печатное.
+PROJECT_LC="$(printf '%s' "$PROJECT" | tr '[:upper:]' '[:lower:]' \
+              | tr -cs 'a-z0-9' '-' | sed 's/^-*//; s/-*$//')"
+[[ -n "$PROJECT_LC" ]] || PROJECT_LC="app"
 YEAR="$(date +%Y)"
 
 subst() {
   local f="$1"
   python3 - "$f" <<'PY'
-import os, sys
+import html, os, sys
 path = sys.argv[1]
 keys = ["HOST","EMAIL","PROJECT","PROJECT_LC","ACCENT","H1","LEAD","WHY",
         "BUILD","ASSET1","ASSET2","DURATION","YEAR"]
-with open(path, encoding="utf-8") as fh:
-    data = fh.read()
+# Эти четыре значения приходят от человека и попадают в разметку: в <title>,
+# в content="..." и в текст страниц. Кавычка или угловая скобка в названии
+# проекта иначе рвёт тег. Остальные ключи генерирует сам скрипт.
+# В .css и .txt подставляем как есть — HTML-сущности были бы там мусором.
+from_user = {"HOST", "EMAIL", "PROJECT", "PROJECT_LC"}
+escape = path.endswith((".html", ".htm"))
+try:
+    with open(path, encoding="utf-8") as fh:
+        data = fh.read()
+except (UnicodeDecodeError, ValueError):
+    raise SystemExit(0)   # картинка или другой бинарник — не наше дело
 for k in keys:
-    data = data.replace("__%s__" % k, os.environ.get("TGW_" + k, ""))
+    value = os.environ.get("TGW_" + k, "")
+    if escape and k in from_user:
+        value = html.escape(value, quote=True)
+    data = data.replace("__%s__" % k, value)
 with open(path, "w", encoding="utf-8") as fh:
     fh.write(data)
 PY
@@ -383,7 +548,7 @@ if ! command -v python3 >/dev/null; then
   die "Нужен python3 для подстановки значений в шаблоны сайта (apt-get install -y python3)."
 fi
 while IFS= read -r -d '' f; do subst "$f"; done \
-  < <(find "$BUILD_DIR" -type f \( -name '*.html' -o -name '*.css' -o -name '*.txt' \) -print0)
+  < <(find "$BUILD_DIR" -type f -print0)
 
 if grep -rq '__[A-Z_]\{2,\}__' "$BUILD_DIR" 2>/dev/null; then
   warn "В сайте остались незаполненные заглушки:"
@@ -415,6 +580,36 @@ cd "$SRC_DIR"
   --secret "$SECRET" \
   --mtproxy-workers "$WORKERS" \
   --mtproxy-max-connections 4096
+
+# Апстрим при повторной установке НЕ обновляет сайт: в deploy/install.sh есть
+# ветка «Preserving the existing /srv/tproxy-site; update it separately».
+# А README этого репозитория советует править site/ и запускать install.sh
+# заново — значит, выкладывать новую сборку должны мы сами.
+if [[ $REINSTALL -eq 1 && -d /srv/tproxy-site ]]; then
+  step "Обновление рабочей копии сайта"
+  site_backup="/srv/tproxy-site.bak.$(date +%Y%m%d%H%M%S)"
+  rm -rf /srv/tproxy-site.new
+  cp -a "$BUILD_DIR" /srv/tproxy-site.new
+  chown -R root:root /srv/tproxy-site.new
+  chmod -R a+rX /srv/tproxy-site.new
+  # два переименования вместо очистки на месте: сайт ни на миг не остаётся пустым
+  mv /srv/tproxy-site "$site_backup"
+  mv /srv/tproxy-site.new /srv/tproxy-site
+  systemctl restart tproxy-server
+  ok "Сайт обновлён, прежняя копия в $site_backup"
+  # держим три последних бэкапа, иначе /srv засорится при частых правках.
+  # сортируем по имени, а не по mtime: у переименованного каталога время
+  # осталось от исходного сайта, и ls -t поставил бы свежую копию последней.
+  ls -1d /srv/tproxy-site.bak.* 2>/dev/null | sort -r | tail -n +4 | xargs -r rm -rf || true
+fi
+
+# Страховка от того же бага с правами: если патч выше не лёг, каталог сборки
+# остался 0700, mtproxy не может выполнить бинарник и уходит в 203/EXEC.
+# chmod идемпотентен, поэтому делаем безусловно.
+if [[ -d /opt/MTProxy ]]; then
+  chmod -R a+rX /opt/MTProxy
+  systemctl is-active --quiet mtproxy || systemctl restart mtproxy 2>/dev/null || true
+fi
 
 # ──────────────────────────── пост-проверки ──────────────────────────────
 step "Проверка сервисов"
@@ -459,7 +654,8 @@ fi
 LINK="https://t.me/webproxy?server=$FQDN&secret=$SECRET"
 {
   printf 'TGweb %s — установлено %s\n\n' "$VERSION" "$(date -Is)"
-  printf 'Тип прокси : WEB\nHostname   : %s\nSecret     : %s\n\n' "$FQDN" "$SECRET"
+  printf 'Тип прокси : WEB\nHostname   : %s\nSecret     : %s\n' "$FQDN" "$SECRET"
+  printf 'Upstream   : %s @ %s\n\n' "${UPSTREAM_REF:-default-branch}" "${UPSTREAM_SHA:-?}"
   printf 'Ссылка     : %s\n' "$LINK"
   printf 'tg://      : tg://webproxy?server=%s&secret=%s\n\n' "$FQDN" "$SECRET"
   printf 'Сайт (сборка) : %s\nСайт (рабочий): /srv/tproxy-site\n' "$BUILD_DIR"
