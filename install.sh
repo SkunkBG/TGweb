@@ -364,14 +364,23 @@ YEAR="$(date +%Y)"
 subst() {
   local f="$1"
   python3 - "$f" <<'PY'
-import os, sys
+import html, os, sys
 path = sys.argv[1]
 keys = ["HOST","EMAIL","PROJECT","PROJECT_LC","ACCENT","H1","LEAD","WHY",
         "BUILD","ASSET1","ASSET2","DURATION","YEAR"]
+# Эти четыре значения приходят от человека и попадают в разметку: в <title>,
+# в content="..." и в текст страниц. Кавычка или угловая скобка в названии
+# проекта иначе рвёт тег. Остальные ключи генерирует сам скрипт.
+# В .css и .txt подставляем как есть — HTML-сущности были бы там мусором.
+from_user = {"HOST", "EMAIL", "PROJECT", "PROJECT_LC"}
+escape = path.endswith((".html", ".htm"))
 with open(path, encoding="utf-8") as fh:
     data = fh.read()
 for k in keys:
-    data = data.replace("__%s__" % k, os.environ.get("TGW_" + k, ""))
+    value = os.environ.get("TGW_" + k, "")
+    if escape and k in from_user:
+        value = html.escape(value, quote=True)
+    data = data.replace("__%s__" % k, value)
 with open(path, "w", encoding="utf-8") as fh:
     fh.write(data)
 PY
