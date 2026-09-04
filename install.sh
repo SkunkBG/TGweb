@@ -9,7 +9,7 @@
 #   sudo bash install.sh --hostname proxy.example.com --email you@example.com \
 #                        --project Soul --yes
 #
-set -euo pipefail
+set -Eeuo pipefail
 
 VERSION="1.0.0"
 UPSTREAM_REPO="https://github.com/telegramdesktop/tproxy-server.git"
@@ -29,11 +29,38 @@ if [[ -t 1 ]]; then
 else
   BOLD=''; DIM=''; GREEN=''; YELLOW=''; RED=''; CYAN=''; OFF=''
 fi
-step() { printf '\n%s==> %s%s\n' "$BOLD" "$1" "$OFF"; }
+CURRENT_STEP="старт"
+step() { CURRENT_STEP="$1"; printf '\n%s==> %s%s\n' "$BOLD" "$1" "$OFF"; }
 ok()   { printf '  %sok%s   %s\n' "$GREEN" "$OFF" "$1"; }
 warn() { printf '  %s!!%s   %s\n' "$YELLOW" "$OFF" "$1"; }
 info() { printf '  %s·%s    %s\n' "$DIM" "$OFF" "$1"; }
 die()  { printf '\n  %sошибка:%s %s\n\n' "$RED" "$OFF" "$1" >&2; exit 1; }
+
+# Без этого set -e обрывает установку молча: человек видит оборванный вывод и
+# не знает, на чём именно всё встало. Трап называет шаг, строку и команду.
+# die() уходит через exit и ERR не поднимает, так что двойных сообщений нет.
+on_error() {
+  local code="$1" line="$2" cmd="$3"
+  printf '\n  %sсорвалось%s на шаге «%s»\n' "$RED" "$OFF" "$CURRENT_STEP" >&2
+  printf '    строка %s, код выхода %s\n' "$line" "$code" >&2
+  printf '    команда: %s\n' "$cmd" >&2
+  case "$CURRENT_STEP" in
+    *"зависимост"*)
+      printf '\n    Похоже на apt. Проверьте: apt-get update && apt-get -f install\n' >&2 ;;
+    *"Получение tproxy-server"*)
+      printf '\n    Проверьте доступ к апстриму: git ls-remote %s\n' "$UPSTREAM_REPO" >&2 ;;
+    *"Сборка сайта"*)
+      printf '\n    Сайт собирается в %s, установка ещё не начиналась —\n' "$BUILD_DIR" >&2
+      printf '    система не изменена, можно спокойно запускать заново.\n' >&2 ;;
+    *"Caddy + relay + MTProxy"*)
+      printf '\n    Установщик апстрима не завершился. Смотрите:\n' >&2
+      printf '      journalctl -u caddy -u tproxy-server -u mtproxy -n 50 --no-pager\n' >&2
+      printf '    Повторный запуск безопасен: секрет сохранён в %s,\n' "$SECRET_FILE" >&2
+      printf '    ссылка на прокси не изменится.\n' >&2 ;;
+  esac
+  printf '\n' >&2
+}
+trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
 # ──────────────────────────── разбор аргументов ───────────────────────────
 FQDN=""; EMAIL=""; PROJECT=""; SECRET=""; WORKERS=""; ASSUME_YES=0; SKIP_DNS=0
