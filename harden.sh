@@ -393,6 +393,6 @@ cat <<EOF
     bash status.sh                               # состояние прокси
 
 ${YELLOW}  Не закрывайте эту сессию,${OFF} пока не проверите вход вторым окном:
-    ssh -p ${ssh_ports[0]} $(id -un)@<адрес сервера>
+    ssh -p ${ssh_ports[0]} ${SUDO_USER:-$(id -un)}@<адрес сервера>
 
 EOF

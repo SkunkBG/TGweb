@@ -33,9 +33,7 @@ confirm "Продолжить?" || { printf '\n  Отменено.\n\n'; exit 0;
 
 step "Остановка сервисов"
 for svc in tproxy-server mtproxy caddy tproxy-firewall refresh-mtproxy-config.timer refresh-mtproxy-config; do
-  if systemctl list-units --all "$svc*" >/dev/null 2>&1; then
-    systemctl disable --now "$svc" >/dev/null 2>&1 && ok "$svc остановлен и отключён" || true
-  fi
+  systemctl disable --now "$svc" >/dev/null 2>&1 && ok "$svc остановлен и отключён" || true
 done
 
 step "Удаление unit-файлов"

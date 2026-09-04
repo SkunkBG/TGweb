@@ -75,7 +75,9 @@ printf '\n%s  TGweb %s%s  %sTelegram WEB-прокси + сайт-прикрыт�
 
 # ──────────────────────────── проверки системы ────────────────────────────
 step "Проверка системы"
-[[ $EUID -eq 0 ]] || die "Нужны права root. Запустите: sudo bash install.sh"
+if [[ "$DRY_RUN" != "1" ]]; then
+  [[ $EUID -eq 0 ]] || die "Нужны права root. Запустите: sudo bash install.sh"
+fi
 [[ -d "$SITE_SRC" ]] || die "Не найден каталог site/ рядом со скриптом.
      Запускайте install.sh из корня клонированного репозитория."
 [[ -f "$SITE_SRC/index.html" ]] || die "В site/ нет index.html — это обязательный файл."
@@ -157,6 +159,8 @@ if [[ -n "$SECRET" ]]; then
   info "Секрет взят из --secret"
 elif [[ -s "$SECRET_FILE" ]]; then
   SECRET="$(tr -d '[:space:]' < "$SECRET_FILE")"
+  [[ "$SECRET" =~ ^(dd)?[0-9a-f]{32}$ ]] || die "В $SECRET_FILE лежит не 32 hex-символа.
+     Задайте секрет явно (--secret HEX) или удалите файл, чтобы сгенерировать новый."
   info "Найден сохранённый секрет в $SECRET_FILE — переиспользую (ссылка не изменится)"
 else
   SECRET="$(openssl rand -hex 16 2>/dev/null || head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
@@ -196,8 +200,8 @@ if [[ "$DRY_RUN" != "1" ]]; then
   step "Установка зависимостей"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq git curl ca-certificates openssl dnsutils iproute2 >/dev/null
-  ok "git, curl, openssl, dig, ss"
+  apt-get install -y -qq git curl ca-certificates openssl dnsutils iproute2 python3 >/dev/null
+  ok "git, curl, openssl, dig, ss, python3"
 fi
 
 # ────────────────────────────── проверка DNS ──────────────────────────────
