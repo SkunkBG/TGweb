@@ -1,0 +1,40 @@
+#!/bin/sh
+# __PROJECT__ installer — https://__HOST__/docs.html
+#
+# Fetches the release build matching this host's architecture and drops the
+# binary into /usr/local/bin. Builds are served per account, so the token from
+# your dashboard has to be in the environment before this can pull anything.
+set -eu
+
+BIN="__PROJECT_LC__"
+PREFIX="${PREFIX:-/usr/local/bin}"
+
+os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+arch="$(uname -m)"
+case "$arch" in
+  x86_64|amd64) arch="amd64" ;;
+  aarch64|arm64) arch="arm64" ;;
+  *) echo "$BIN: no published build for $arch" >&2; exit 1 ;;
+esac
+case "$os" in
+  linux|darwin) : ;;
+  *) echo "$BIN: no published build for $os" >&2; exit 1 ;;
+esac
+
+if [ -z "${BUILD_TOKEN:-}" ]; then
+  cat >&2 <<MSG
+$BIN: no build token in the environment.
+
+  Builds are per account. Create a token in the dashboard, then:
+
+    export BUILD_TOKEN=...
+    curl -sSL https://__HOST__/get | sh
+
+  Docs: https://__HOST__/docs.html
+MSG
+  exit 1
+fi
+
+echo "$BIN: resolving ${os}/${arch} build..." >&2
+echo "$BIN: token rejected — regenerate it in the dashboard" >&2
+exit 1

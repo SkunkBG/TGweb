@@ -13,6 +13,12 @@ set -Eeuo pipefail
 
 VERSION="1.0.0"
 UPSTREAM_REPO="https://github.com/telegramdesktop/tproxy-server.git"
+# Пусто — ветка по умолчанию у remote (у апстрима это master, но имя может
+# смениться, поэтому не зашиваем). Эта ветка движется, а её код собирается и
+# запускается от root, и три патча ниже привязаны к её текущему виду. Флаг
+# --upstream-ref фиксирует проверенный коммит или тег; собранный SHA всегда
+# печатается и попадает в info.txt, чтобы было видно, что именно установлено.
+UPSTREAM_REF=""
 SRC_DIR="/opt/tproxy-src"
 BUILD_DIR="/opt/tgweb-site"
 STATE_DIR="/etc/tgweb"
@@ -83,6 +89,8 @@ TGweb $VERSION — установка Telegram WEB-прокси с сайтом-
   --project NAME       название проекта для сайта-прикрытия
   --secret HEX         32 hex-символа (по умолчанию генерируется случайный)
   --workers N          воркеров MTProxy (по умолчанию по числу ядер, максимум 4)
+  --upstream-ref REF   ветка, тег или коммит tproxy-server
+                       (по умолчанию — ветка по умолчанию у апстрима)
   --skip-dns-check     не сверять A-запись с внешним IP
   -y, --yes            не спрашивать подтверждение
   -h, --help           эта справка
@@ -96,6 +104,7 @@ while [[ $# -gt 0 ]]; do
     --project) PROJECT="${2:-}"; shift 2 ;;
     --secret) SECRET="${2:-}"; shift 2 ;;
     --workers) WORKERS="${2:-}"; shift 2 ;;
+    --upstream-ref) UPSTREAM_REF="${2:-}"; shift 2 ;;
     --skip-dns-check) SKIP_DNS=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -349,16 +358,28 @@ fi
 # ───────────────────────── исходники tproxy-server ───────────────────────
 if [[ "$DRY_RUN" != "1" ]]; then
   step "Получение tproxy-server"
-  if [[ -d "$SRC_DIR/.git" ]]; then
-    git -C "$SRC_DIR" fetch --depth 1 origin >/dev/null 2>&1 || true
-    git -C "$SRC_DIR" reset --hard FETCH_HEAD >/dev/null 2>&1 || true
-    ok "Обновлён: $SRC_DIR"
-  else
+  if [[ ! -d "$SRC_DIR/.git" ]]; then
     rm -rf "$SRC_DIR"
     git clone --depth 1 "$UPSTREAM_REPO" "$SRC_DIR" >/dev/null 2>&1 \
       || die "Не удалось склонировать $UPSTREAM_REPO — проверьте выход в интернет."
-    ok "Склонирован в $SRC_DIR"
   fi
+  # ref берём явно: raw-SHA GitHub тоже отдаёт, так что подойдёт и ветка,
+  # и тег, и коммит. Прежняя версия глушила ошибку fetch, и при обрыве сети
+  # собиралось молча то, что уже лежало на диске.
+  if [[ -n "$UPSTREAM_REF" ]]; then
+    git -C "$SRC_DIR" fetch --depth 1 origin "$UPSTREAM_REF" >/dev/null 2>&1 \
+      || die "Не удалось получить «$UPSTREAM_REF» из $UPSTREAM_REPO.
+     Проверьте сеть и что такая ветка, тег или коммит там есть."
+  else
+    git -C "$SRC_DIR" fetch --depth 1 origin >/dev/null 2>&1 \
+      || die "Не удалось обновить $SRC_DIR из $UPSTREAM_REPO — проверьте выход в интернет."
+  fi
+  git -C "$SRC_DIR" reset --hard FETCH_HEAD >/dev/null 2>&1 \
+    || die "Не удалось переключить $SRC_DIR на ${UPSTREAM_REF:-ветку по умолчанию}."
+  UPSTREAM_SHA="$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+  ok "tproxy-server: ${UPSTREAM_REF:-ветка по умолчанию} @ ${UPSTREAM_SHA:0:12} ($SRC_DIR)"
+  [[ -z "$UPSTREAM_REF" ]] && \
+    info "Ветка движется без предупреждения; зафиксировать: --upstream-ref ${UPSTREAM_SHA:0:12}"
   [[ -x "$SRC_DIR/deploy/install.sh" ]] || chmod +x "$SRC_DIR/deploy/install.sh" 2>/dev/null || true
   [[ -f "$SRC_DIR/deploy/install.sh" ]] || die "В tproxy-server нет deploy/install.sh — структура изменилась, см. его README."
 
@@ -481,7 +502,12 @@ BUILD_ID="$(rand_hex 4)"
 ASSET1="as_$(rand_hex 4)"
 ASSET2="as_$(rand_hex 4)"
 DURATION="$(( (RANDOM % 900 + 120) * 1000 + RANDOM % 999 ))"
-PROJECT_LC="$(printf '%s' "$PROJECT" | tr '[:upper:]' '[:lower:]')"
+# PROJECT_LC уходит в логотип, но и в примеры команд и в имя каталога на
+# страницах, поэтому это должен быть идентификатор: название проекта может
+# содержать пробелы и что угодно печатное.
+PROJECT_LC="$(printf '%s' "$PROJECT" | tr '[:upper:]' '[:lower:]' \
+              | tr -cs 'a-z0-9' '-' | sed 's/^-*//; s/-*$//')"
+[[ -n "$PROJECT_LC" ]] || PROJECT_LC="app"
 YEAR="$(date +%Y)"
 
 subst() {
@@ -497,8 +523,11 @@ keys = ["HOST","EMAIL","PROJECT","PROJECT_LC","ACCENT","H1","LEAD","WHY",
 # В .css и .txt подставляем как есть — HTML-сущности были бы там мусором.
 from_user = {"HOST", "EMAIL", "PROJECT", "PROJECT_LC"}
 escape = path.endswith((".html", ".htm"))
-with open(path, encoding="utf-8") as fh:
-    data = fh.read()
+try:
+    with open(path, encoding="utf-8") as fh:
+        data = fh.read()
+except (UnicodeDecodeError, ValueError):
+    raise SystemExit(0)   # картинка или другой бинарник — не наше дело
 for k in keys:
     value = os.environ.get("TGW_" + k, "")
     if escape and k in from_user:
@@ -519,7 +548,7 @@ if ! command -v python3 >/dev/null; then
   die "Нужен python3 для подстановки значений в шаблоны сайта (apt-get install -y python3)."
 fi
 while IFS= read -r -d '' f; do subst "$f"; done \
-  < <(find "$BUILD_DIR" -type f \( -name '*.html' -o -name '*.css' -o -name '*.txt' \) -print0)
+  < <(find "$BUILD_DIR" -type f -print0)
 
 if grep -rq '__[A-Z_]\{2,\}__' "$BUILD_DIR" 2>/dev/null; then
   warn "В сайте остались незаполненные заглушки:"
@@ -625,7 +654,8 @@ fi
 LINK="https://t.me/webproxy?server=$FQDN&secret=$SECRET"
 {
   printf 'TGweb %s — установлено %s\n\n' "$VERSION" "$(date -Is)"
-  printf 'Тип прокси : WEB\nHostname   : %s\nSecret     : %s\n\n' "$FQDN" "$SECRET"
+  printf 'Тип прокси : WEB\nHostname   : %s\nSecret     : %s\n' "$FQDN" "$SECRET"
+  printf 'Upstream   : %s @ %s\n\n' "${UPSTREAM_REF:-default-branch}" "${UPSTREAM_SHA:-?}"
   printf 'Ссылка     : %s\n' "$LINK"
   printf 'tg://      : tg://webproxy?server=%s&secret=%s\n\n' "$FQDN" "$SECRET"
   printf 'Сайт (сборка) : %s\nСайт (рабочий): /srv/tproxy-site\n' "$BUILD_DIR"

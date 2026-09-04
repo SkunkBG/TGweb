@@ -1,0 +1,95 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # раз в неделю — чтобы дрейф апстрима заметил CI, а не пользователь
+    - cron: '17 6 * * 1'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: for f in *.sh; do bash -n "$f"; done
+      - name: shellcheck
+        run: shellcheck -S warning *.sh
+      - name: site/get валиден как POSIX sh
+        run: sh -n site/get
+
+  dry-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: сборка сайта без установки
+        run: |
+          TGWEB_DRY_RUN=1 bash install.sh \
+            --hostname test.example.com --email ops@example.com \
+            --project 'Demo" onload="x <b>&' --yes
+      - name: незаполненных заглушек не осталось
+        run: |
+          if grep -rq '__[A-Z_]\{2,\}__' /tmp/tgweb-site-dryrun; then
+            grep -rho '__[A-Z_]\{2,\}__' /tmp/tgweb-site-dryrun | sort -u
+            exit 1
+          fi
+      - name: разметка цела, значения экранированы
+        run: |
+          python3 - <<'PY'
+          import glob, html.parser, sys
+          # Экранированное значение оставляет в тексте строку вида onload=&quot;,
+          # поэтому наивный поиск подстроки даёт ложную тревогу. Проверяем именно
+          # атрибуты: обработчик события в теге означает, что значение прорвалось.
+          class Check(html.parser.HTMLParser):
+              def handle_starttag(self, tag, attrs):
+                  for name, _ in attrs:
+                      if name.startswith('on'):
+                          sys.exit(f'{self.path}: атрибут {name} в теге <{tag}>')
+          for f in sorted(glob.glob('/tmp/tgweb-site-dryrun/*.html')):
+              p = Check()
+              p.path = f
+              p.feed(open(f, encoding='utf-8').read())
+          print('html ok')
+          PY
+      - name: собранный /get валиден как POSIX sh
+        run: sh -n /tmp/tgweb-site-dryrun/get
+
+  upstream-drift:
+    # install.sh правит три места в чужом установщике. Если апстрим изменит их
+    # вид, патчи молча не применятся — эта проверка ловит именно такой случай.
+    # Уже исправленный апстримом баг ошибкой не считается.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: клон tproxy-server
+        run: git clone --depth 1 https://github.com/telegramdesktop/tproxy-server.git /tmp/upstream
+      - name: цели патчей на месте
+        run: |
+          fail=0
+          i=/tmp/upstream/deploy/install.sh
+          m=/tmp/upstream/deploy/install-mtproxy.sh
+
+          if grep -q 'umask 077' "$i"; then
+            echo "· umask 077 в апстриме на месте (причина обоих багов)"
+          else
+            echo "· umask 077 из апстрима пропал — патчи, возможно, больше не нужны"
+          fi
+
+          if grep -qF 'umask 022 && "$go_binary" test' "$i"; then
+            echo "ok  go test уже под umask 022 — апстрим починил, патч не нужен"
+          elif grep -qF '"$go_binary" test ./...' "$i"; then
+            echo "ok  цель патча go test найдена"
+          else
+            echo "FAIL вызов go test изменился — sed в install.sh промахнётся"; fail=1
+          fi
+
+          if grep -qF 'chmod -R a+rX "$build_directory"' "$m"; then
+            echo "ok  права сборки MTProxy уже чинит апстрим"
+          elif grep -qF 'chown -R root:root "$build_directory"' "$m"; then
+            echo "ok  цель патча прав MTProxy найдена"
+          else
+            echo "FAIL chown в install-mtproxy.sh изменился — sed промахнётся"; fail=1
+          fi
+
+          exit $fail
