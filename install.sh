@@ -22,6 +22,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SITE_SRC="$SCRIPT_DIR/site"
 DRY_RUN="${TGWEB_DRY_RUN:-0}"
 
+# Признак того, что установщик апстрима здесь уже отработал. Меняет две вещи:
+# занятые Caddy порты 80/443 перестают быть конфликтом, и рабочую копию сайта
+# приходится обновлять самим (см. ниже).
+REINSTALL=0
+[[ -f /etc/tproxy-server/config.json ]] && REINSTALL=1
+
 # ─────────────────────────────── оформление ───────────────────────────────
 if [[ -t 1 ]]; then
   BOLD=$'\033[1m'; DIM=$'\033[2m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
@@ -315,14 +321,23 @@ if [[ "$DRY_RUN" != "1" ]]; then
   fi
 
   step "Проверка портов 80 и 443"
+  # Повторный запуск ради обновления сайта — штатный сценарий, и порты в этот
+  # момент держит наш же Caddy. Чужой слушатель по-прежнему повод остановиться.
+  busy=0
   for p in 80 443; do
-    if ss -lnt "sport = :$p" 2>/dev/null | grep -q LISTEN; then
-      holder="$(ss -lntp "sport = :$p" 2>/dev/null | awk 'NR==2{print $NF}')"
-      die "Порт $p занят: ${holder:-неизвестно}
-     Наружу должен слушать только Caddy. Например: systemctl disable --now nginx"
+    ss -lnt "sport = :$p" 2>/dev/null | grep -q LISTEN || continue
+    busy=1
+    holders="$(ss -lntpH "sport = :$p" 2>/dev/null \
+               | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | sort -u | tr '\n' ' ')"
+    holders="${holders% }"          # хвостовой пробел от tr
+    if [[ "$holders" == "caddy" && $REINSTALL -eq 1 ]]; then
+      info "Порт $p держит Caddy этой же установки — это повторный запуск"
+      continue
     fi
+    die "Порт $p занят: ${holders:-неизвестно}
+     Наружу должен слушать только Caddy. Например: systemctl disable --now nginx"
   done
-  ok "80 и 443 свободны"
+  [[ $busy -eq 0 ]] && ok "80 и 443 свободны" || ok "80 и 443 заняты своим Caddy"
 
   if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
     ufw allow 80/tcp >/dev/null 2>&1 || true
@@ -536,6 +551,28 @@ cd "$SRC_DIR"
   --secret "$SECRET" \
   --mtproxy-workers "$WORKERS" \
   --mtproxy-max-connections 4096
+
+# Апстрим при повторной установке НЕ обновляет сайт: в deploy/install.sh есть
+# ветка «Preserving the existing /srv/tproxy-site; update it separately».
+# А README этого репозитория советует править site/ и запускать install.sh
+# заново — значит, выкладывать новую сборку должны мы сами.
+if [[ $REINSTALL -eq 1 && -d /srv/tproxy-site ]]; then
+  step "Обновление рабочей копии сайта"
+  site_backup="/srv/tproxy-site.bak.$(date +%Y%m%d%H%M%S)"
+  rm -rf /srv/tproxy-site.new
+  cp -a "$BUILD_DIR" /srv/tproxy-site.new
+  chown -R root:root /srv/tproxy-site.new
+  chmod -R a+rX /srv/tproxy-site.new
+  # два переименования вместо очистки на месте: сайт ни на миг не остаётся пустым
+  mv /srv/tproxy-site "$site_backup"
+  mv /srv/tproxy-site.new /srv/tproxy-site
+  systemctl restart tproxy-server
+  ok "Сайт обновлён, прежняя копия в $site_backup"
+  # держим три последних бэкапа, иначе /srv засорится при частых правках.
+  # сортируем по имени, а не по mtime: у переименованного каталога время
+  # осталось от исходного сайта, и ls -t поставил бы свежую копию последней.
+  ls -1d /srv/tproxy-site.bak.* 2>/dev/null | sort -r | tail -n +4 | xargs -r rm -rf || true
+fi
 
 # Страховка от того же бага с правами: если патч выше не лёг, каталог сборки
 # остался 0700, mtproxy не может выполнить бинарник и уходит в 203/EXEC.
