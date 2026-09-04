@@ -273,18 +273,38 @@ if [[ "$DRY_RUN" != "1" ]]; then
   #   config_test.go:248: group/other-readable profiles file ... was accepted
   # Из-за set -e установка обрывается до сборки. Возвращаем тестам обычный
   # umask — остальные тесты при этом продолжают выполняться.
+  # Каждый sed ниже правит чужой файл вслепую, поэтому результат проверяется
+  # grep-ом: молча не применившийся патч дороже честной ошибки.
   upstream_installer="$SRC_DIR/deploy/install.sh"
+
+  tests_disabled=0
   if [[ "${TGWEB_SKIP_UPSTREAM_TESTS:-0}" == "1" ]]; then
-    sed -i 's|^(cd "$repository" && \(umask 022 && \)\?"$go_binary" test \./\.\.\.)|# отключено TGWEB_SKIP_UPSTREAM_TESTS: \0|' \
+    sed -i 's|^(cd "$repository" && \(umask 022 && \)\?"$go_binary" test \./\.\.\.)|# отключено TGWEB_SKIP_UPSTREAM_TESTS: &|' \
       "$upstream_installer"
-    warn "Тесты апстрима отключены (TGWEB_SKIP_UPSTREAM_TESTS=1)"
-  elif grep -q 'umask 022 && "$go_binary" test' "$upstream_installer"; then
-    info "Патч umask для go test уже применён"
-  elif grep -q '"$go_binary" test \./\.\.\.' "$upstream_installer"; then
-    sed -i 's|"$go_binary" test \./\.\.\.|umask 022 \&\& "$go_binary" test ./...|' "$upstream_installer"
-    ok "Патч: go test запускается с umask 022 (обход бага апстрима)"
-  else
-    warn "Строка с go test в апстриме не найдена — вероятно, баг уже исправлен."
+    if grep -q '^# отключено TGWEB_SKIP_UPSTREAM_TESTS' "$upstream_installer"; then
+      tests_disabled=1
+      warn "Тесты апстрима отключены (TGWEB_SKIP_UPSTREAM_TESTS=1)"
+    else
+      warn "TGWEB_SKIP_UPSTREAM_TESTS=1, но строку с go test закомментировать не вышло —"
+      warn "апстрим изменил её вид. Пробую вместо этого патч umask."
+    fi
+  fi
+
+  if [[ $tests_disabled -eq 0 ]]; then
+    if grep -q 'umask 022 && "$go_binary" test' "$upstream_installer"; then
+      info "Патч umask для go test уже применён"
+    elif grep -q '"$go_binary" test \./\.\.\.' "$upstream_installer"; then
+      sed -i 's|"$go_binary" test \./\.\.\.|umask 022 \&\& "$go_binary" test ./...|' "$upstream_installer"
+      if grep -q 'umask 022 && "$go_binary" test' "$upstream_installer"; then
+        ok "Патч: go test запускается с umask 022 (обход бага апстрима)"
+      else
+        die "Патч umask не применился к $upstream_installer.
+     Тесты апстрима упадут на правах фикстуры и оборвут установку.
+     Обход: TGWEB_SKIP_UPSTREAM_TESTS=1 sudo -E bash install.sh ..."
+      fi
+    else
+      warn "Строка с go test в апстриме не найдена — вероятно, баг уже исправлен."
+    fi
   fi
 
   # ── Второй симптом того же umask 077 ────────────────────────────────────
@@ -301,7 +321,12 @@ if [[ "$DRY_RUN" != "1" ]]; then
     elif grep -q 'chown -R root:root "$build_directory"' "$mtproxy_installer"; then
       sed -i 's|chown -R root:root "$build_directory"|chmod -R a+rX "$build_directory"\n\tchown -R root:root "$build_directory"|' \
         "$mtproxy_installer"
-      ok "Патч: сборка MTProxy получает права, читаемые пользователем mtproxy"
+      if grep -q 'chmod -R a+rX "$build_directory"' "$mtproxy_installer"; then
+        ok "Патч: сборка MTProxy получает права, читаемые пользователем mtproxy"
+      else
+        warn "Патч прав MTProxy НЕ применился — каталог сборки останется 0700."
+        warn "Права будут поправлены после установки, но проверьте $mtproxy_installer."
+      fi
     else
       warn "Строка chown в install-mtproxy.sh не найдена — вероятно, баг уже исправлен."
     fi
@@ -428,6 +453,14 @@ cd "$SRC_DIR"
   --secret "$SECRET" \
   --mtproxy-workers "$WORKERS" \
   --mtproxy-max-connections 4096
+
+# Страховка от того же бага с правами: если патч выше не лёг, каталог сборки
+# остался 0700, mtproxy не может выполнить бинарник и уходит в 203/EXEC.
+# chmod идемпотентен, поэтому делаем безусловно.
+if [[ -d /opt/MTProxy ]]; then
+  chmod -R a+rX /opt/MTProxy
+  systemctl is-active --quiet mtproxy || systemctl restart mtproxy 2>/dev/null || true
+fi
 
 # ──────────────────────────── пост-проверки ──────────────────────────────
 step "Проверка сервисов"
