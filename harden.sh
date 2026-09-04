@@ -13,7 +13,7 @@
 # nftables (inet tproxy_backend) висит на своём хуке и закрывает 2398/8888
 # снаружи. ufw работает в отдельной таблице, конфликта нет.
 #
-set -euo pipefail
+set -Eeuo pipefail
 
 SYSCTL_FILE="/etc/sysctl.d/99-tgweb.conf"
 JOURNALD_FILE="/etc/systemd/journald.conf.d/99-tgweb.conf"
@@ -26,11 +26,38 @@ if [[ -t 1 ]]; then
 else
   BOLD=''; DIM=''; GREEN=''; YELLOW=''; RED=''; OFF=''
 fi
-step() { printf '\n%s==> %s%s\n' "$BOLD" "$1" "$OFF"; }
+CURRENT_STEP="старт"
+step() { CURRENT_STEP="$1"; printf '\n%s==> %s%s\n' "$BOLD" "$1" "$OFF"; }
 ok()   { printf '  %sok%s   %s\n' "$GREEN" "$OFF" "$1"; }
 warn() { printf '  %s!!%s   %s\n' "$YELLOW" "$OFF" "$1"; }
 info() { printf '  %s·%s    %s\n' "$DIM" "$OFF" "$1"; }
 die()  { printf '\n  %sошибка:%s %s\n\n' "$RED" "$OFF" "$1" >&2; exit 1; }
+
+# Обрыв по set -e здесь опаснее, чем в install.sh: между сбросом ufw и его
+# включением сервер остаётся без файрвола, и человек должен узнать об этом
+# сразу, а не по оборванному выводу. die() уходит через exit и ERR не поднимает.
+on_error() {
+  local code="$1" line="$2" cmd="$3"
+  printf '\n  %sсорвалось%s на шаге «%s»\n' "$RED" "$OFF" "$CURRENT_STEP" >&2
+  printf '    строка %s, код выхода %s\n    команда: %s\n' "$line" "$code" "$cmd" >&2
+  case "$CURRENT_STEP" in
+    *"Файрвол"*)
+      printf '\n    %sНЕ ЗАКРЫВАЙТЕ ЭТУ СЕССИЮ.%s Правила могли остаться сброшенными,\n' "$RED" "$OFF" >&2
+      printf '    а ufw выключенным — сервер сейчас без файрвола. Проверьте:\n' >&2
+      printf '      ufw status verbose\n' >&2
+      printf '    Прежние правила ufw отложил в /etc/ufw/*.rules.<таймстамп>,\n' >&2
+      printf '    вернуть: mv /etc/ufw/user.rules.<таймстамп> /etc/ufw/user.rules && ufw reload\n' >&2 ;;
+    *"fail2ban"*)
+      printf '\n    Конфиг: %s, прежний рядом с суффиксом .bak.\n' "$JAIL_FILE" >&2
+      printf '    Проверка: fail2ban-client -t; журнал: journalctl -u fail2ban -n 40\n' >&2 ;;
+    *"тюнинг"*)
+      printf '\n    Откат: rm -f %s && sysctl --system\n' "$SYSCTL_FILE" >&2 ;;
+    *"Своп"*|*"журнал"*|*"Автообновления"*)
+      printf '\n    Файрвол и fail2ban к этому моменту уже настроены, это последний блок.\n' >&2 ;;
+  esac
+  printf '\n' >&2
+}
+trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
 DO_FIREWALL=1; DO_FAIL2BAN=1; DO_TUNING=1; DO_EXTRAS=1; ASSUME_YES=0
 usage() {
@@ -131,10 +158,24 @@ if [[ $DO_FIREWALL -eq 1 ]]; then
   for p in "${ssh_ports[@]}"; do
     printf '    разрешить : %s/tcp (SSH, с ограничением частоты)\n' "$p"
   done
-  printf '    разрешить : 80/tcp, 443/tcp (Caddy)\n\n'
+  printf '    разрешить : 80/tcp, 443/tcp (Caddy)\n'
+
+  # Раньше сброс шёл молча, и человек не видел, что теряет. ufw переносит
+  # текущие файлы правил в /etc/ufw/*.rules.<таймстамп> (src/backend_iptables.py),
+  # так что откат есть — но сказать об этом надо до, а не после.
+  existing="$(ufw status numbered 2>/dev/null | sed -n '/^\[/p' || true)"
+  if [[ -n "$existing" ]]; then
+    printf '\n  %sТекущие правила будут сброшены%s — сейчас их %s:\n' \
+      "$YELLOW" "$OFF" "$(printf '%s\n' "$existing" | wc -l | tr -d ' ')"
+    printf '%s\n' "$existing" | sed 's/^/       /'
+    printf '    Копии останутся в /etc/ufw/*.rules.<таймстамп>\n'
+  fi
+  printf '\n'
 
   if confirm "Применить?"; then
-    ufw --force reset >/dev/null 2>&1 || true
+    # на несколько секунд между reset и enable сервер остаётся без файрвола
+    reset_out="$(ufw --force reset 2>&1 || true)"
+    printf '%s\n' "$reset_out" | grep -i "backing up" | sed 's/^/       /' || true
     ufw default deny incoming >/dev/null
     ufw default allow outgoing >/dev/null
     for p in "${ssh_ports[@]}"; do ufw limit "$p/tcp" comment 'SSH' >/dev/null; done
@@ -358,8 +399,22 @@ SystemMaxUse=200M
 SystemMaxFileSize=20M
 MaxRetentionSec=1month
 EOF
-  systemctl restart systemd-journald 2>/dev/null || true
-  ok "journald ограничен 200 МБ ($JOURNALD_FILE)"
+  ok "Записан $JOURNALD_FILE (лимит 200 МБ)"
+  # Место освобождаем сразу и без рестарта — это безопасно.
+  if journalctl --vacuum-size=200M >/dev/null 2>&1; then
+    ok "Журнал ужат до 200 МБ прямо сейчас (journalctl --vacuum-size)"
+  fi
+  # А вот сам лимит journald читает только при старте. Рестарт при этом рвёт
+  # stdout-потоки уже запущенных юнитов: их вывод пропадёт из журнала до
+  # собственного рестарта. Поэтому спрашиваем, а не делаем молча.
+  if confirm "Перезапустить systemd-journald, чтобы лимит действовал уже сейчас?"; then
+    systemctl restart systemd-journald 2>/dev/null || true
+    ok "journald перезапущен, лимит в силе"
+    info "Сервисы, писавшие в журнал через stdout, стоит перезапустить, иначе"
+    info "их вывод не попадёт в журнал до следующего рестарта."
+  else
+    info "Лимит вступит в силу после перезагрузки — файл на месте, ничего делать не надо"
+  fi
 
   step "Автообновления безопасности"
   if confirm "Включить unattended-upgrades?"; then
