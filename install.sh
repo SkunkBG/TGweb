@@ -211,14 +211,70 @@ if [[ "$DRY_RUN" != "1" ]]; then
     warn "Проверка пропущена (--skip-dns-check)"
   else
     myip="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || echo '')"
-    resolved="$(dig +short A "$FQDN" @1.1.1.1 2>/dev/null | tail -n1 || true)"
-    if [[ -z "$resolved" ]]; then
-      die "A-запись для $FQDN не найдена.
-     Создайте у DNS-провайдера запись A на IP этого сервера${myip:+ ($myip)},
-     дождитесь распространения и запустите скрипт снова.
+
+    # dig +short молчит одинаково и когда записи нет, и когда резолвер
+    # недоступен. Разница принципиальная: в первом случае человек правит зону,
+    # во втором провайдер режет исходящий DNS и правка зоны не поможет.
+    # Поэтому смотрим на статус ответа и обходим несколько резолверов.
+    dig_a() {
+      local server="$1" type="$2"
+      if [[ -n "$server" ]]; then
+        dig +time=3 +tries=1 "$server" "$type" "$FQDN" 2>/dev/null
+      else
+        dig +time=3 +tries=1 "$type" "$FQDN" 2>/dev/null
+      fi
+    }
+
+    dns_status=""; resolved=""; used_resolver=""
+    for server in "@1.1.1.1" "@9.9.9.9" ""; do
+      answer="$(dig_a "$server" A || true)"
+      status="$(printf '%s\n' "$answer" | sed -n 's/.*status: \([A-Z]*\).*/\1/p' | head -n1)"
+      [[ -z "$status" ]] && continue          # этот резолвер не ответил вовсе
+      # в сообщениях ссылаемся на того, кто ответил первым...
+      if [[ -z "$dns_status" ]]; then
+        dns_status="$status"; used_resolver="${server:-системный}"
+      fi
+      # берём именно A из ANSWER: при цепочке CNAME последняя строка не адрес
+      resolved="$(printf '%s\n' "$answer" | awk '$4=="A"{print $5}' | head -n1)"
+      # ...но если запись нашлась только у следующего — верим ему
+      if [[ -n "$resolved" ]]; then
+        dns_status="$status"; used_resolver="${server:-системный}"
+        break
+      fi
+    done
+
+    # последний шанс: штатный резолвер libc, если 53/UDP закрыт именно для dig
+    if [[ -z "$dns_status" ]]; then
+      resolved="$(getent ahostsv4 "$FQDN" 2>/dev/null | awk '{print $1; exit}' || true)"
+      [[ -n "$resolved" ]] && { dns_status="NOERROR"; used_resolver="getent"; }
+    fi
+
+    if [[ -z "$dns_status" ]]; then
+      die "Ни один DNS-резолвер не ответил: 1.1.1.1, 9.9.9.9, системный, getent.
+     Похоже на блокировку исходящего DNS, а не на отсутствие записи —
+     правка зоны у провайдера тут не поможет. Проверьте руками:
+       dig A $FQDN @1.1.1.1
      Обойти проверку: --skip-dns-check"
     fi
-    ok "$FQDN -> $resolved"
+
+    if [[ "$dns_status" == "NXDOMAIN" ]]; then
+      die "Домена $FQDN не существует (NXDOMAIN, ответил $used_resolver).
+     Создайте запись A на IP этого сервера${myip:+ ($myip)} и дождитесь распространения.
+     Обойти проверку: --skip-dns-check"
+    fi
+
+    if [[ -z "$resolved" ]]; then
+      aaaa="$(dig_a "@1.1.1.1" AAAA | awk '$4=="AAAA"{print $5}' | head -n1 || true)"
+      die "У $FQDN нет A-записи (ответ $dns_status от $used_resolver).${aaaa:+
+     Нашлась только AAAA ($aaaa), а ACME и Telegram придут по IPv4.}
+     Создайте запись A на IP этого сервера${myip:+ ($myip)}.
+     Обойти проверку: --skip-dns-check"
+    fi
+
+    [[ "$resolved" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] \
+      || die "Резолвер $used_resolver вернул не IPv4-адрес: $resolved"
+
+    ok "$FQDN -> $resolved (резолвер $used_resolver)"
     if [[ -n "$myip" && "$resolved" != "$myip" ]]; then
       warn "Внешний IP сервера $myip не совпадает с A-записью $resolved."
       warn "Если домен за Cloudflare — ОТКЛЮЧИТЕ проксирование (серая тучка, DNS only):"
